@@ -32,6 +32,12 @@ def create_app(config_name: str | None = None) -> Flask:
     )
     app.logger.info("Iniciando aplicação NetMonitor (env=%s)", config_name)
 
+    # --- Garante que o diretório do banco SQLite exista ---
+    # O SQLite cria o arquivo .db, mas não a pasta que o contém. Em uma máquina
+    # nova (instance/ está no .gitignore) isso causaria "unable to open database
+    # file". Criamos o diretório aqui para que o setup funcione sem passos manuais.
+    _ensure_sqlite_dir(app)
+
     # --- Extensões ---
     db.init_app(app)
     migrate.init_app(app, db)
@@ -80,6 +86,21 @@ def create_app(config_name: str | None = None) -> Flask:
             _init_scheduler(app)
 
     return app
+
+
+def _ensure_sqlite_dir(app: Flask):
+    """Cria o diretório do banco SQLite, se aplicável.
+
+    Só age sobre URIs sqlite:/// com caminho em disco (ignora :memory: e
+    outros backends como PostgreSQL).
+    """
+    uri = app.config.get("SQLALCHEMY_DATABASE_URI", "")
+    if not uri.startswith("sqlite:///") or ":memory:" in uri:
+        return
+    db_path = uri[len("sqlite:///"):]
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
 
 def _register_blueprints(app: Flask):
