@@ -1,7 +1,7 @@
 """add device_online_snapshots table
 
 Revision ID: 4b9b3781130b
-Revises: 
+Revises: 00000000base
 Create Date: 2026-03-30 10:04:55.091085
 
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = '4b9b3781130b'
-down_revision = None
+down_revision = '00000000base'
 branch_labels = None
 depends_on = None
 

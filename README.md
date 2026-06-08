@@ -56,9 +56,13 @@ cp .env.example .env        # ajuste SECRET_KEY, DATABASE_URL, etc.
 
 ```bash
 export FLASK_APP=manage.py
-flask db upgrade            # aplica as migrations
-# (ou, num banco novo sem migrations: flask init-db)
+flask db upgrade            # cria/atualiza o schema (funciona em banco novo)
 ```
+
+> A primeira migration (`00000000base`) cria o schema base, então `flask db upgrade`
+> basta para um banco do zero — não é preciso rodar `flask init-db` antes.
+> O comando `flask init-db` ainda existe como atalho de bootstrap (`db.create_all`),
+> mas nesse caso rode `flask db stamp head` em seguida para registrar as migrations.
 
 ### Primeiro usuário admin
 
@@ -93,8 +97,8 @@ Acesse `http://localhost:5000` e faça login.
 ## Comandos CLI
 
 ```bash
-flask db upgrade                                   # aplica migrations
-flask init-db                                      # cria tabelas (bootstrap)
+flask db upgrade                                   # cria/atualiza o schema (banco novo ou existente)
+flask init-db                                      # bootstrap alternativo via db.create_all (depois: flask db stamp head)
 flask seed-admin --password '<senha>'              # cria/promove admin
 flask create-user --username X --password Y --role {viewer|operator|admin}
 flask set-role --username X --role admin
