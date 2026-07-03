@@ -82,3 +82,61 @@ class TestGetOpenPorts:
         result = get_open_ports(ports)
         assert len(result) == 2
         assert all(p.state == "open" for p in result)
+
+
+class TestPruneStaleScanState:
+    """Poda diária do estado em memória do scanner (dicts de módulo)."""
+
+    def test_prune_removes_orphans_and_keeps_valid(self, db, sample_profile):
+        from collections import deque
+        from app.models import Device
+        from app.scanner import scheduling
+
+        device = Device(
+            profile_id=sample_profile.id,
+            mac="AA:BB:CC:DD:EE:77",
+            alert_on_down=True,
+        )
+        db.session.add(device)
+        db.session.commit()
+
+        orphan_id = 999_999  # device inexistente / profile inexistente
+        try:
+            with scheduling._quick_host_down_lock:
+                scheduling._quick_host_down_failures[orphan_id] = 2
+                scheduling._quick_host_down_failures[device.id] = 1
+            with scheduling._port_scan_retry_lock:
+                scheduling._port_scan_retry_args[orphan_id] = 1
+                scheduling._port_scan_retry_args[device.id] = 0
+            with scheduling._port_scan_queues_lock:
+                scheduling._port_scan_queues[orphan_id] = deque()
+                scheduling._port_scan_queues[sample_profile.id] = deque()
+
+            scheduling._prune_stale_scan_state()
+
+            # Órfãos removidos...
+            assert orphan_id not in scheduling._quick_host_down_failures
+            assert orphan_id not in scheduling._port_scan_retry_args
+            assert orphan_id not in scheduling._port_scan_queues
+            # ...entradas válidas preservadas.
+            assert device.id in scheduling._quick_host_down_failures
+            assert device.id in scheduling._port_scan_retry_args
+            assert sample_profile.id in scheduling._port_scan_queues
+
+            # Device sem alert_on_down perde o contador de host-down.
+            device.alert_on_down = False
+            db.session.commit()
+            scheduling._prune_stale_scan_state()
+            assert device.id not in scheduling._quick_host_down_failures
+            assert device.id in scheduling._port_scan_retry_args  # device existe
+        finally:
+            # Limpa para não vazar estado para outros testes.
+            with scheduling._quick_host_down_lock:
+                scheduling._quick_host_down_failures.pop(device.id, None)
+                scheduling._quick_host_down_failures.pop(orphan_id, None)
+            with scheduling._port_scan_retry_lock:
+                scheduling._port_scan_retry_args.pop(device.id, None)
+                scheduling._port_scan_retry_args.pop(orphan_id, None)
+            with scheduling._port_scan_queues_lock:
+                scheduling._port_scan_queues.pop(sample_profile.id, None)
+                scheduling._port_scan_queues.pop(orphan_id, None)

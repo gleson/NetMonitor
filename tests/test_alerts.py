@@ -136,14 +136,22 @@ def test_api_open_alert_count(auth_client, db, sample_profile):
 
 
 def test_notify_min_severity_gating(db, sample_profile):
-    """_maybe_notify respeita Profile.notify_min_severity."""
+    """_maybe_notify respeita Profile.notify_min_severity.
+
+    O gate de severidade roda em _maybe_notify ANTES de preparar a notificação,
+    então stubamos prepare_notification para registrar quais alertas passaram.
+    """
     from app.scanner import scheduling
 
-    sent = []
-    # Stub do notify_alert para não tocar rede.
+    prepared_for = []
+    # Stub de prepare_notification: registra o alerta e devolve um payload fake.
     import app.notifications as notifications
-    original_notify = notifications.notify_alert
-    notifications.notify_alert = lambda alert, profile=None, device=None: sent.append(alert)
+    original_prepare = notifications.prepare_notification
+    notifications.prepare_notification = (
+        lambda alert, profile=None, device=None:
+            prepared_for.append(alert) or {"payload": alert}
+    )
+    scheduling._discard_pending_notifications()  # isola de outros testes na thread
     try:
         sample_profile.notify_min_severity = "WARNING"
         db.session.commit()
@@ -158,11 +166,12 @@ def test_notify_min_severity_gating(db, sample_profile):
         scheduling._maybe_notify(info_alert, sample_profile, None)
         scheduling._maybe_notify(warn_alert, sample_profile, None)
     finally:
-        notifications.notify_alert = original_notify
+        notifications.prepare_notification = original_prepare
+        scheduling._discard_pending_notifications()
 
     # INFO abaixo do mínimo (WARNING) não notifica; WARNING sim.
-    assert info_alert not in sent
-    assert warn_alert in sent
+    assert info_alert not in prepared_for
+    assert warn_alert in prepared_for
 
 
 def test_api_acknowledge_alert_viewer_forbidden(auth_client, db, sample_profile):

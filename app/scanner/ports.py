@@ -111,8 +111,12 @@ def scan_ports_for_host(
                 for port_num in port_list:
                     port_data = nm[host][proto][port_num]
                     state = port_data.get("state", "unknown")
-                    # Ignora portas explicitamente fechadas — não são interessantes
-                    if state == "closed":
+                    # Ignora portas fechadas (não interessantes) e 'unfiltered'
+                    # (estado exclusivo do ACK scan -sA: prova que a porta não é
+                    # filtrada, mas NÃO que está aberta). Deixar 'unfiltered' passar
+                    # sobrescreveria o estado 'open' no banco e geraria alertas
+                    # espúrios de mudança de estado.
+                    if state in ("closed", "unfiltered"):
                         continue
                     results.append(PortInfo(
                         port=port_num,

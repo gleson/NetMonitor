@@ -19,10 +19,24 @@ from ipaddress import ip_address, ip_network
 
 import nmap
 
+from app.scanner.ports import CRITICAL_PORTS
+
 logger = logging.getLogger(__name__)
 
 # Regex para MAC válido (6 grupos de 2 hex separados por :)
 _MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+# Portas usadas para provar liveness via TCP (fallback quando ICMP e ARP falham).
+# Inclui os serviços mais comuns E todas as CRITICAL_PORTS: um host que bloqueia
+# ICMP e só expõe, por exemplo, 3389 (RDP) numa sub-rede roteada (sem entrada ARP
+# fresca) ficaria invisível se a porta dele não fosse sondada. Basta o stack TCP
+# responder em qualquer porta — um RST (porta fechada) também confirma o host.
+# Serviços mais prováveis primeiro para retorno rápido no caso típico.
+_LIVENESS_PROBE_PORTS: tuple[int, ...] = tuple(dict.fromkeys([
+    80, 443, 22, 8080, 8443, 445, 3389, 53, 8888, 5900, 7,
+    *sorted(CRITICAL_PORTS),
+    139, 135, 23, 3306, 5432, 8000, 8081, 9090,
+]))
 
 
 @dataclass
@@ -188,7 +202,9 @@ def _ping_to_populate_arp(ip: str):
             ["ping", "-c", "1", "-W", "1", ip],
             capture_output=True, timeout=3,
         )
-    except Exception:
+    except (subprocess.TimeoutExpired, OSError):
+        # Ruído esperado (host lento, binário ausente) — o objetivo é só
+        # popular o cache ARP, então falha aqui não é erro.
         pass
 
 
@@ -412,8 +428,8 @@ def _ping_sweep_parallel(network, exclude_ips: set[str]):
                 ["ping", "-c", "1", "-W", "1", ip],
                 capture_output=True, timeout=3,
             )
-        except Exception:
-            pass
+        except (subprocess.TimeoutExpired, OSError):
+            pass  # falha individual é ruído esperado no sweep
 
     # 20 workers: gera no máximo 20 ARP requests simultâneos na rede,
     # evitando inundar switches com requisições ARP em rajada.
@@ -516,8 +532,6 @@ def _tcp_probe(ip: str, timeout: float = 1.5) -> int | None:
     import errno as _errno
     import socket as _socket
 
-    common_ports = [80, 443, 22, 8080, 8443, 53, 8888, 5900, 445, 7]
-
     def try_port(port: int) -> int | None:
         try:
             with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
@@ -527,12 +541,16 @@ def _tcp_probe(ip: str, timeout: float = 1.5) -> int | None:
                 # ECONNREFUSED = porta fechada mas HOST ONLINE (TCP stack respondeu RST)
                 if err == 0 or err == _errno.ECONNREFUSED:
                     return port
-        except Exception:
+        except OSError:
+            # timeout/rede inalcançável — equivale a "porta não respondeu"
             pass
         return None
 
-    with ThreadPoolExecutor(max_workers=len(common_ports)) as executor:
-        for result in executor.map(try_port, common_ports):
+    # Todas as portas são sondadas em paralelo; o custo de wall-clock é limitado
+    # pelo timeout (não pela quantidade de portas), então ampliar a lista não
+    # deixa o probe mais lento — só aumenta a chance de detectar o host.
+    with ThreadPoolExecutor(max_workers=min(len(_LIVENESS_PROBE_PORTS), 32)) as executor:
+        for result in executor.map(try_port, _LIVENESS_PROBE_PORTS):
             if result is not None:
                 return result
     return None

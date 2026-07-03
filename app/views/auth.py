@@ -12,12 +12,17 @@ from app.models import User, AuditLog, _utcnow
 auth_bp = Blueprint("auth", __name__, template_folder="../templates/auth")
 
 
-def _failed_attempts_since_success(username: str, window_minutes: int) -> int:
+def _failed_attempts_since_success(
+    username: str, window_minutes: int, ip: str | None = None,
+) -> int:
     """Conta logins falhos de ``username`` na janela, desde o último sucesso.
 
     Um login bem-sucedido zera efetivamente o contador (a contagem só considera
     falhas posteriores ao último ``login.success``). Baseado no AuditLog, então
     sobrevive a reinícios e funciona com múltiplos workers.
+
+    Com ``ip`` informado, conta apenas falhas originadas daquele endereço
+    (o ``audit('login.fail')`` grava ``request.remote_addr`` em ``ip_address``).
     """
     window_start = _utcnow() - timedelta(minutes=window_minutes)
 
@@ -31,24 +36,41 @@ def _failed_attempts_since_success(username: str, window_minutes: int) -> int:
     if last_success and last_success.created_at and last_success.created_at > window_start:
         effective_start = last_success.created_at
 
-    return (
-        AuditLog.query
-        .filter(
-            AuditLog.action == "login.fail",
-            AuditLog.username == username,
-            AuditLog.created_at >= effective_start,
-        )
-        .count()
+    q = AuditLog.query.filter(
+        AuditLog.action == "login.fail",
+        AuditLog.username == username,
+        AuditLog.created_at >= effective_start,
     )
+    if ip:
+        q = q.filter(AuditLog.ip_address == ip)
+    return q.count()
 
 
 def _is_locked_out(username: str) -> bool:
-    """True se a conta excedeu o limite de falhas na janela de bloqueio."""
+    """True se a conta excedeu o limite de falhas na janela de bloqueio.
+
+    Dois limites independentes:
+    - Por (usuário, IP de origem): ``LOGIN_MAX_FAILED_ATTEMPTS`` falhas vindas
+      do MESMO IP bloqueiam apenas aquele IP. Assim um atacante que erre senhas
+      de propósito não nega acesso ao usuário legítimo conectando de outro
+      endereço (DoS de conta).
+    - Global por usuário: ``LOGIN_MAX_FAILED_ATTEMPTS_GLOBAL`` falhas somadas de
+      qualquer origem ainda bloqueiam a conta inteira — backstop contra
+      brute-force distribuído (que escaparia do limite por IP). 0 desativa.
+    """
     max_attempts = int(current_app.config.get("LOGIN_MAX_FAILED_ATTEMPTS", 5))
     window = int(current_app.config.get("LOGIN_LOCKOUT_MINUTES", 15))
     if max_attempts <= 0 or not username:
         return False
-    return _failed_attempts_since_success(username, window) >= max_attempts
+
+    ip = request.remote_addr or ""
+    if ip and _failed_attempts_since_success(username, window, ip=ip) >= max_attempts:
+        return True
+
+    max_global = int(current_app.config.get("LOGIN_MAX_FAILED_ATTEMPTS_GLOBAL", 30))
+    if max_global > 0:
+        return _failed_attempts_since_success(username, window) >= max_global
+    return False
 
 
 @auth_bp.route("/login", methods=["GET", "POST"])

@@ -60,7 +60,8 @@ def _nvd_api_key() -> str:
     try:
         from flask import current_app
         return (current_app.config.get("NVD_API_KEY") or "").strip()
-    except Exception:
+    except RuntimeError:
+        # Fora de app context (ex.: chamado de script) — segue sem key.
         return ""
 
 

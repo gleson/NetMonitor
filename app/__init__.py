@@ -45,6 +45,12 @@ def create_app(config_name: str | None = None) -> Flask:
     csrf.init_app(app)
     limiter.init_app(app)
 
+    # Notificações de alertas só disparam APÓS o commit da transação que as
+    # originou (via listeners after_commit/after_rollback na sessão). Registrado
+    # aqui para valer também fora do scheduler (scans on-demand, correlação CVE).
+    from app.scanner.scheduling import register_notification_hooks
+    register_notification_hooks(db)
+
     # --- Cabeçalhos de segurança via Talisman ---
     # CSP permissiva o suficiente para o Bootstrap/Chart.js (CDN) + handlers
     # inline existentes nos templates. Força HTTPS apenas em produção.
@@ -162,6 +168,9 @@ def _register_template_context(app: Flask):
         try:
             profiles = Profile.query.filter_by(is_active=True).order_by(Profile.name).all()
         except Exception:
+            # Fallback para não derrubar a renderização (ex.: banco ainda não
+            # migrado), mas registra — um erro real de banco não pode ficar mudo.
+            app.logger.debug("inject_globals: falha ao listar profiles", exc_info=True)
             profiles = []
 
         active_profile = None
@@ -172,6 +181,7 @@ def _register_template_context(app: Flask):
             if active_profile is None and profiles:
                 active_profile = profiles[0]
         except Exception:
+            app.logger.debug("inject_globals: falha ao resolver profile ativo", exc_info=True)
             if profiles:
                 active_profile = profiles[0]
 
@@ -185,6 +195,7 @@ def _register_template_context(app: Flask):
                 q = q.filter_by(profile_id=active_profile.id)
             open_alerts_count = q.count()
         except Exception:
+            app.logger.debug("inject_globals: falha ao contar alertas abertos", exc_info=True)
             open_alerts_count = 0
 
         return dict(

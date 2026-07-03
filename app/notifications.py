@@ -105,21 +105,24 @@ def _dispatch(app, payload: dict, webhook_url: str, email: str, subject: str, bo
             _send_email(cfg, email, subject, body)
 
 
-def notify_alert(alert, profile=None, device=None) -> None:
-    """Dispara notificações para um alerta recém-criado.
+def prepare_notification(alert, profile=None, device=None) -> dict | None:
+    """Materializa tudo que a notificação precisa ENQUANTO a sessão está viva.
 
-    Lê `webhook_url` e `notify_email` do profile. Só envia se o profile tiver
-    algum canal configurado. A execução roda em thread separada para não
-    bloquear a transação chamadora. Seguro chamar antes ou depois do commit.
+    Lê `webhook_url`/`notify_email` do profile e monta o payload (incluindo
+    consultas como `device.current_ip`). Retorna um dict pronto para envio, ou
+    None quando não há canal configurado / notificações desabilitadas / fora de
+    app context. O envio pela rede deve ocorrer só depois do commit — ver
+    `send_prepared`. Assim uma notificação não sai para um alerta que sofre
+    rollback.
     """
     try:
         app = current_app._get_current_object()
     except RuntimeError:
-        logger.debug("notify_alert fora de app context — ignorando.")
-        return
+        logger.debug("prepare_notification fora de app context — ignorando.")
+        return None
 
     if not app.config.get("NOTIFICATIONS_ENABLED", True):
-        return
+        return None
 
     if profile is None and alert.profile_id:
         from app.models import Profile
@@ -130,7 +133,7 @@ def notify_alert(alert, profile=None, device=None) -> None:
     email = (profile.notify_email or "").strip() if profile else ""
 
     if not webhook_url and not email:
-        return
+        return None
 
     if device is None and alert.device_id:
         from app.models import Device
@@ -151,12 +154,40 @@ def notify_alert(alert, profile=None, device=None) -> None:
     ]
     body = "\n".join(body_lines)
 
+    return {
+        "app": app,
+        "payload": payload,
+        "webhook_url": webhook_url,
+        "email": email,
+        "subject": subject,
+        "body": body,
+    }
+
+
+def send_prepared(prepared: dict | None) -> None:
+    """Dispara em thread daemon uma notificação já materializada por
+    `prepare_notification`. No-op se `prepared` for None. Não bloqueia o chamador.
+    """
+    if not prepared:
+        return
     t = threading.Thread(
         target=_dispatch,
-        args=(app, payload, webhook_url, email, subject, body),
+        args=(
+            prepared["app"], prepared["payload"], prepared["webhook_url"],
+            prepared["email"], prepared["subject"], prepared["body"],
+        ),
         daemon=True,
     )
     t.start()
 
 
-__all__ = ["notify_alert"]
+def notify_alert(alert, profile=None, device=None) -> None:
+    """Compat: prepara e envia imediatamente (sem esperar commit).
+
+    Prefira `prepare_notification` + `send_prepared` (após o commit) no fluxo de
+    alertas para não notificar sobre alertas que podem sofrer rollback.
+    """
+    send_prepared(prepare_notification(alert, profile=profile, device=device))
+
+
+__all__ = ["notify_alert", "prepare_notification", "send_prepared"]

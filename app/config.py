@@ -29,11 +29,18 @@ class Config:
     RATELIMIT_HEADERS_ENABLED = True
 
     # --- Bloqueio de conta por tentativas de login falhas ---
-    # Após LOGIN_MAX_FAILED_ATTEMPTS falhas (por usuário) dentro da janela
-    # LOGIN_LOCKOUT_MINUTES, novas tentativas são bloqueadas até a janela expirar
-    # ou um login bem-sucedido. 0 desativa o bloqueio (mantém só o rate-limit/IP).
+    # Após LOGIN_MAX_FAILED_ATTEMPTS falhas (por usuário + IP de origem) dentro
+    # da janela LOGIN_LOCKOUT_MINUTES, novas tentativas daquele IP são bloqueadas
+    # até a janela expirar ou um login bem-sucedido. 0 desativa o bloqueio
+    # (mantém só o rate-limit/IP).
     LOGIN_MAX_FAILED_ATTEMPTS = int(os.environ.get("LOGIN_MAX_FAILED_ATTEMPTS", 5))
     LOGIN_LOCKOUT_MINUTES = int(os.environ.get("LOGIN_LOCKOUT_MINUTES", 15))
+    # Backstop global (soma de falhas de QUALQUER IP): protege contra brute-force
+    # distribuído sem permitir que um único IP hostil bloqueie o usuário legítimo.
+    # 0 desativa o limite global (fica só o por-IP).
+    LOGIN_MAX_FAILED_ATTEMPTS_GLOBAL = int(
+        os.environ.get("LOGIN_MAX_FAILED_ATTEMPTS_GLOBAL", 30)
+    )
 
     # --- Intervalos padrão de scan (em minutos) ---
     DEFAULT_HOST_DISCOVERY_INTERVAL = 45

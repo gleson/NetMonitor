@@ -65,10 +65,13 @@ def _has_root() -> bool:
 def _remove_job_quiet(job_id: str) -> None:
     """Remove um job do scheduler ignorando inexistência (job desabilitado)."""
     from app.extensions import scheduler
+    from apscheduler.jobstores.base import JobLookupError
     try:
         scheduler.remove_job(job_id)
+    except JobLookupError:
+        pass  # job não existe — é exatamente o estado desejado
     except Exception:
-        pass
+        logger.exception("Erro inesperado ao remover job '%s'.", job_id)
 
 
 def register_jobs_for_all_profiles(app: Flask):
@@ -121,7 +124,10 @@ def _register_profile_jobs(app: Flask, profile):
         next_run_time=_preserve_or_default(discovery_job_id, 90),
     )
 
-    # Job de port scan — primeiro run após a primeira discovery ter tempo de concluir
+    # Job de port scan — primeiro run após a primeira discovery ter tempo de concluir.
+    # Tem de ser MAIOR que o offset da discovery (90s); caso contrário o port scan
+    # dispara antes, varre todos os devices já existentes no DB e o usuário vê um
+    # PORT_SCAN "para todos" no boot em vez do DISCOVERY esperado.
     portscan_job_id = f"portscan_profile_{profile.id}"
     scheduler.add_job(
         func=_run_with_context,
@@ -132,7 +138,7 @@ def _register_profile_jobs(app: Flask, profile):
         name=f"Port Scan - {profile.name}",
         replace_existing=True,
         max_instances=1,
-        next_run_time=_preserve_or_default(portscan_job_id, 60),
+        next_run_time=_preserve_or_default(portscan_job_id, 210),
     )
 
     # Job de verificação rápida HOST_DOWN (ping leve a cada N min)
@@ -204,6 +210,8 @@ def _get_quick_host_down_interval(app: Flask) -> int:
         from app.models import AppSetting
         return AppSetting.get_int("host_down_quick_check_interval", default)
     except Exception:
+        # Fallback para o default da config (ex.: tabela ainda não migrada).
+        logger.debug("Falha ao ler AppSetting do quick check — usando default.", exc_info=True)
         return default
 
 
@@ -215,15 +223,19 @@ def sync_quick_host_down_jobs(app: Flask) -> None:
     if not scheduler.running:
         return
 
+    from apscheduler.jobstores.base import JobLookupError
+
     interval = _get_quick_host_down_interval(app)
     for profile in Profile.query.filter_by(is_active=True).all():
         job_id = f"host_down_profile_{profile.id}"
         try:
             scheduler.reschedule_job(job_id, trigger="interval", minutes=interval)
             logger.info("Job '%s' re-agendado para %d min.", job_id, interval)
-        except Exception:
+        except JobLookupError:
             # Job não existe — _register_profile_jobs vai criá-lo no próximo sync
             pass
+        except Exception:
+            logger.exception("Erro ao re-agendar job '%s'.", job_id)
 
 
 def sync_profile_jobs(app: Flask, profile) -> None:
@@ -269,6 +281,11 @@ def remove_profile_jobs(profile_id: int) -> None:
         except Exception:
             logger.exception("Erro ao remover job '%s'.", job_id)
 
+    # Descarta a fila de port scan do perfil — sem os jobs ela nunca mais
+    # seria consumida e ficaria ocupando memória até o restart.
+    with _port_scan_queues_lock:
+        _port_scan_queues.pop(profile_id, None)
+
 
 def register_global_jobs(app: Flask):
     """Registra jobs globais (não associados a profile).
@@ -308,10 +325,7 @@ def register_global_jobs(app: Flask):
         logger.info("Job global de backup registrado (a cada %dh).", backup_hours)
     else:
         # Remove um job remanescente caso o backup tenha sido desabilitado.
-        try:
-            scheduler.remove_job("global_backup_database")
-        except Exception:
-            pass
+        _remove_job_quiet("global_backup_database")
         logger.info("Backup automático desabilitado (BACKUP_INTERVAL_HOURS=0 ou DB não-SQLite).")
 
     # Verificação de certificados TLS em portas HTTPS abertas.
@@ -389,6 +403,10 @@ def run_host_discovery(profile_id: int):
     db.session.commit()
 
     total_hosts = 0
+    # IDs distintos de devices vistos online nesta rodada. Usado no snapshot e em
+    # scan.hosts_found: somar len(hosts) por range infla a contagem quando o mesmo
+    # device aparece em ranges sobrepostos ou é redescoberto pelo suplemento ARP.
+    seen_device_ids: set[int] = set()
     errors = []
 
     try:
@@ -514,6 +532,10 @@ def run_host_discovery(profile_id: int):
                                 "Device não autorizado visto: %s (%s)", mac, host.ip
                             )
 
+                # Device resolvido (novo ou existente) — conta uma única vez,
+                # mesmo que reapareça em outro range ou pelo suplemento ARP.
+                seen_device_ids.add(device.id)
+
                 # Detecção de conflito de IP: outro device do mesmo perfil já usa
                 # este IP como current → dois MACs distintos reivindicando o mesmo IP.
                 conflict_dip = (
@@ -623,7 +645,8 @@ def run_host_discovery(profile_id: int):
 
         # Marca resultado no banco
         scan.finished_at = _utcnow()
-        scan.hosts_found = total_hosts
+        online_count = len(seen_device_ids)
+        scan.hosts_found = online_count
         if errors and total_hosts == 0:
             scan.status = ScanStatus.ERROR
             scan.error_message = "; ".join(errors)
@@ -640,7 +663,7 @@ def run_host_discovery(profile_id: int):
         snapshot = DeviceOnlineSnapshot(
             profile_id=profile.id,
             recorded_at=_utcnow(),
-            online_count=total_hosts,
+            online_count=online_count,
         )
         db.session.add(snapshot)
         db.session.commit()
@@ -846,8 +869,12 @@ def _next_alternate_nmap_args(device_id: int) -> str:
         ("-Pn -sS -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"
          if os.geteuid() == 0
          else "-Pn -sT -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"),
-        # ACK scan para detectar firewall stateful (open|filtered).
-        "-Pn -sA -T4 --host-timeout 300s",
+        # Connect scan lento e paciente, sem -sV (mais leve, menos host-timeout),
+        # para hosts que limitam a taxa de conexões / têm IDS que descarta rajadas.
+        # NÃO usar -sA aqui: o ACK scan nunca reporta 'open' (só detecta filtragem,
+        # devolvendo 'unfiltered'), então poluiria o estado das portas e geraria
+        # alertas espúrios [open → unfiltered] em vez de reencontrar as portas.
+        "-Pn -sT -T2 --max-retries 2 --host-timeout 400s",
     ]
     with _port_scan_retry_lock:
         idx = _port_scan_retry_args.get(device_id, -1)
@@ -898,6 +925,10 @@ def prepend_to_port_scan_queue(profile_id: int, device_id: int, device_display: 
     except Exception:
         from app.scanner.ports import DEFAULT_PORTS
         ports = DEFAULT_PORTS
+        logger.warning(
+            "Falha ao resolver portas configuradas para %s (profile %d) — "
+            "usando DEFAULT_PORTS.", ip, profile_id, exc_info=True,
+        )
 
     entry = {
         "device_id": device_id,
@@ -1020,6 +1051,16 @@ def run_port_scan(profile_id: int):
 
         def _scan_single(task):
             """Executa o nmap — só usa strings, sem acesso ao Flask/DB."""
+            from app.scanner.hosts import is_host_reachable
+            # Confirma que o host está online ANTES de escanear. Como o port scan
+            # usa -Pn, o nmap assume o host up e reporta host_found=True mesmo
+            # quando ele caiu — o que marcaria indevidamente as portas abertas
+            # como fechadas (e re-alertaria na volta). Verificando alcançabilidade
+            # primeiro, hosts que ficaram offline retornam host_found=False e o
+            # processamento abaixo preserva as portas e re-enfileira o device.
+            is_up, _ = is_host_reachable(task["ip"])
+            if not is_up:
+                return task, [], False
             # Se este device foi marcado para retry com scan alternativo, usa.
             override = task.get("nmap_arguments")
             port_list, host_found = scan_ports_for_host(
@@ -1734,7 +1775,9 @@ def run_on_demand_scan(device_id: int, scan_types: list[str]) -> dict:
         return _run_on_demand_scan_inner(device_id, scan_types)
     finally:
         with _on_demand_lock:
-            _on_demand_locks[device_id] = False
+            # pop (e não =False) para o dict não acumular uma entrada morta
+            # por device escaneado durante a vida do processo.
+            _on_demand_locks.pop(device_id, None)
 
 
 def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
@@ -1783,6 +1826,27 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
 
     # --- Port Scan ---
     if "ports" in scan_types:
+        from app.scanner.hosts import is_host_reachable
+        # Confirma liveness ANTES de escanear. O port scan usa -Pn, então o nmap
+        # reportaria o host como up mesmo offline e fecharia as portas que
+        # estavam abertas. Reaproveita o resultado do ping desta mesma execução
+        # quando disponível para não pingar duas vezes.
+        if "ping" in scan_types and isinstance(results.get("ping"), dict):
+            host_is_up = bool(results["ping"].get("is_up"))
+        else:
+            host_is_up, _ = is_host_reachable(ip)
+
+        if not host_is_up:
+            # Host offline: não escaneia nem altera portas — preserva o baseline.
+            # O scan_record é finalizado no fim da função (hosts_found=0).
+            results["ports"] = []
+            results["ports_skipped"] = (
+                "Host offline — scan de portas ignorado. As portas abertas "
+                "registradas foram preservadas."
+            )
+            scan_record.result_summary = "Host offline — port scan ignorado."
+
+    if "ports" in scan_types and results.get("ports_skipped") is None:
         from app.models import IpRange, Profile
         _profile = db.session.get(Profile, device.profile_id)
         _profile_default_ports = (_profile.default_ports or "") if _profile else ""
@@ -2136,13 +2200,71 @@ def _scan_vulnerabilities(ip: str) -> dict:
 # Notificações de alertas CRITICAL / WARNING
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fila de notificações pendentes (disparadas só APÓS o commit).
+#
+# Thread-local: cada thread (jobs do scheduler, threads de scan on-demand,
+# requisições) acumula suas notificações e o hook after_commit — que roda na
+# MESMA thread que fez o commit — as dispara. Assim uma notificação nunca sai
+# para um alerta que sofre rollback (o hook after_rollback descarta a fila).
+# ---------------------------------------------------------------------------
+_pending_notifications = threading.local()
+_notification_hooks_registered = False
+
+
+def _get_pending_notifications() -> list:
+    queue = getattr(_pending_notifications, "queue", None)
+    if queue is None:
+        queue = []
+        _pending_notifications.queue = queue
+    return queue
+
+
+def _flush_pending_notifications(*_args) -> None:
+    """Envia (após commit) as notificações preparadas nesta thread e limpa a fila."""
+    queue = getattr(_pending_notifications, "queue", None)
+    if not queue:
+        return
+    # Copia e zera antes de enviar para não reprocessar em commits aninhados.
+    pending, _pending_notifications.queue = list(queue), []
+    from app.notifications import send_prepared
+    for prepared in pending:
+        try:
+            send_prepared(prepared)
+        except Exception:
+            logger.exception("Falha ao enviar notificação preparada")
+
+
+def _discard_pending_notifications(*_args) -> None:
+    """Descarta (após rollback) as notificações preparadas nesta thread."""
+    _pending_notifications.queue = []
+
+
+def register_notification_hooks(db) -> None:
+    """Liga o disparo de notificações ao ciclo de commit/rollback da sessão.
+
+    Idempotente: registrar duas vezes é inofensivo (o flush copia-e-zera a fila),
+    mas guardamos um flag para não empilhar listeners.
+    """
+    global _notification_hooks_registered
+    if _notification_hooks_registered:
+        return
+    from sqlalchemy import event
+    event.listen(db.session, "after_commit", _flush_pending_notifications)
+    event.listen(db.session, "after_rollback", _discard_pending_notifications)
+    _notification_hooks_registered = True
+
+
 def _maybe_notify(alert, profile, device) -> None:
-    """Dispara notificação externa para alertas relevantes.
+    """Prepara uma notificação externa para alertas relevantes (envio pós-commit).
 
     Notifica quando a severidade do alerta é >= ao nível mínimo configurado no
     perfil (``Profile.notify_min_severity``, default CRITICAL). Assim um perfil
     pode optar por receber também WARNING (NEW_DEVICE/UNAUTHORIZED/IP_CONFLICT)
     sem afetar os demais.
+
+    O payload é montado agora (com a sessão viva), mas o envio pela rede só
+    ocorre quando a transação der commit — ver ``register_notification_hooks``.
     Falha silenciosa: notificação nunca bloqueia o fluxo de scan.
     """
     from app.models import severity_rank
@@ -2152,15 +2274,17 @@ def _maybe_notify(alert, profile, device) -> None:
         return
     try:
         from app.extensions import db
-        from app.notifications import notify_alert
+        from app.notifications import prepare_notification
         # Flush para aplicar os defaults da coluna (id, created_at) antes de
-        # montar o payload — _maybe_notify normalmente roda antes do commit,
-        # então sem isto o webhook/e-mail sairia com id=None e created_at vazio.
+        # montar o payload — _maybe_notify roda antes do commit, então sem isto
+        # o webhook/e-mail sairia com id=None e created_at vazio.
         if alert.id is None or alert.created_at is None:
             db.session.flush()
-        notify_alert(alert, profile=profile, device=device)
+        prepared = prepare_notification(alert, profile=profile, device=device)
+        if prepared:
+            _get_pending_notifications().append(prepared)
     except Exception:
-        logger.exception("Falha ao enfileirar notificação para alert")
+        logger.exception("Falha ao preparar notificação para alert")
 
 
 # ---------------------------------------------------------------------------
@@ -2388,6 +2512,45 @@ def refresh_placeholder_macs(profile_id: int | None = None, prefix: str = "02:00
 # Job: Retenção — limpa dados antigos
 # ---------------------------------------------------------------------------
 
+def _prune_stale_scan_state() -> None:
+    """Remove entradas órfãs dos dicts de estado em memória do scanner.
+
+    Os dicts de módulo (contadores de host-down, índices de scan alternativo,
+    filas por perfil) são keyed por device_id/profile_id e nunca esquecem uma
+    chave sozinhos — devices deletados ou com alert_on_down desligado deixariam
+    entradas mortas acumulando pela vida do processo. Chamado pelo job diário
+    de limpeza.
+    """
+    from app.extensions import db
+    from app.models import Device, Profile
+
+    device_ids = {row[0] for row in db.session.query(Device.id).all()}
+    monitored_ids = {
+        row[0]
+        for row in db.session.query(Device.id).filter(Device.alert_on_down.is_(True)).all()
+    }
+    active_profile_ids = {
+        row[0] for row in db.session.query(Profile.id).filter(Profile.is_active.is_(True)).all()
+    }
+
+    removed = 0
+    with _quick_host_down_lock:
+        for did in [d for d in _quick_host_down_failures if d not in monitored_ids]:
+            del _quick_host_down_failures[did]
+            removed += 1
+    with _port_scan_retry_lock:
+        for did in [d for d in _port_scan_retry_args if d not in device_ids]:
+            del _port_scan_retry_args[did]
+            removed += 1
+    with _port_scan_queues_lock:
+        for pid in [p for p in _port_scan_queues if p not in active_profile_ids]:
+            del _port_scan_queues[pid]
+            removed += 1
+
+    if removed:
+        logger.info("Estado de scan em memória: %d entrada(s) órfã(s) removida(s).", removed)
+
+
 def cleanup_old_data():
     """Remove registros antigos conforme *_RETENTION_DAYS.
 
@@ -2451,6 +2614,11 @@ def cleanup_old_data():
     except Exception:
         db.session.rollback()
         logger.exception("Erro em cleanup_old_data")
+
+    try:
+        _prune_stale_scan_state()
+    except Exception:
+        logger.exception("Erro ao podar estado de scan em memória")
 
 
 # ---------------------------------------------------------------------------

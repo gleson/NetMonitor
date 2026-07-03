@@ -1,10 +1,14 @@
 """Endpoint de health-check para monitoramento externo."""
 
+import logging
+
 from flask import jsonify
 from sqlalchemy import text
 
 from app.api import api_bp
 from app.extensions import db, limiter
+
+logger = logging.getLogger(__name__)
 
 
 @api_bp.route("/healthz")
@@ -20,7 +24,9 @@ def healthz():
         db.session.execute(text("SELECT 1"))
         db_ok = True
     except Exception:
-        pass
+        # 503 sem nenhum log tornaria o diagnóstico impossível pelo lado
+        # do servidor — registra a causa antes de responder "degraded".
+        logger.exception("Health-check: banco de dados inacessível")
 
     status = "ok" if db_ok else "degraded"
     code = 200 if db_ok else 503
