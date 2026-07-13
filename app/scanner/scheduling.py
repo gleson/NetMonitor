@@ -204,6 +204,26 @@ def _register_profile_jobs(app: Flask, profile):
     else:
         _remove_job_quiet(udp_job_id)
 
+    # Topologia L2 (LLDP + FDB via SNMP) — opcional, desligada por padrão.
+    topology_job_id = f"topology_profile_{profile.id}"
+    from app.scanner.topology import is_topology_enabled
+    topo_hours = int(app.config.get("TOPOLOGY_LLDP_INTERVAL_HOURS", 6))
+    if is_topology_enabled(app) and topo_hours > 0 and profile.snmp_enabled:
+        from app.scanner.topology import discover_switch_topology
+        scheduler.add_job(
+            func=_run_with_context,
+            args=[app, discover_switch_topology, profile.id],
+            trigger="interval",
+            hours=topo_hours,
+            id=topology_job_id,
+            name=f"Topologia L2 - {profile.name}",
+            replace_existing=True,
+            max_instances=1,
+            next_run_time=_preserve_or_default(topology_job_id, 360),
+        )
+    else:
+        _remove_job_quiet(topology_job_id)
+
     logger.info(
         "Jobs registrados para profile '%s': discovery=%dmin, portscan=%dmin, quick_host_down=%dmin",
         profile.name, profile.host_discovery_interval_minutes,
@@ -250,6 +270,22 @@ def sync_quick_host_down_jobs(app: Flask) -> None:
             logger.exception("Erro ao re-agendar job '%s'.", job_id)
 
 
+def sync_topology_jobs(app: Flask) -> None:
+    """Re-registra/remove os jobs de topologia quando o admin alterna a flag.
+
+    Reaproveita ``_register_profile_jobs`` (idempotente, replace_existing) para
+    cada perfil ativo — que já cria ou remove o job de topologia conforme
+    ``is_topology_enabled``.
+    """
+    from app.extensions import scheduler
+    from app.models import Profile
+
+    if not scheduler.running:
+        return
+    for profile in Profile.query.filter_by(is_active=True).all():
+        _register_profile_jobs(app, profile)
+
+
 def sync_profile_jobs(app: Flask, profile) -> None:
     """Registra ou atualiza os jobs de scan de um perfil no scheduler em execução.
 
@@ -283,6 +319,7 @@ def remove_profile_jobs(profile_id: int) -> None:
         f"host_down_profile_{profile_id}",
         f"critical_ports_profile_{profile_id}",
         f"udp_scan_profile_{profile_id}",
+        f"topology_profile_{profile_id}",
     ]
     for job_id in job_ids:
         try:
@@ -806,6 +843,34 @@ def _check_ghost_devices(profile) -> int:
 _PORT_SCAN_COOLDOWN_HOURS = 24
 
 
+def _passive_only_nets(ranges) -> list:
+    """Redes (ip_network) das faixas habilitadas marcadas como passive_only.
+
+    ``ranges`` é uma lista de IpRange já carregada; filtramos em memória para
+    não repetir query. CIDRs inválidos são ignorados.
+    """
+    nets = []
+    for r in ranges:
+        if not getattr(r, "passive_only", False):
+            continue
+        try:
+            nets.append(ipaddress.ip_network(r.cidr, strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _ip_is_passive_only(ip_str: str, passive_nets) -> bool:
+    """True se o IP pertence a alguma faixa passive_only (sem port scan ativo)."""
+    if not passive_nets:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in n for n in passive_nets)
+
+
 def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
     """Carrega devices ATIVOS do profile e monta a lista de tasks para port scan.
 
@@ -858,16 +923,28 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
         )
 
     enabled_ranges = IpRange.query.filter_by(profile_id=profile_id, enabled=True).all()
+    passive_nets = _passive_only_nets(enabled_ranges)
 
-    return [
-        {
+    tasks = []
+    skipped_passive = 0
+    for device, device_ip in devices_with_ip:
+        # Smart polling: devices em faixas passive_only não recebem port scan.
+        if _ip_is_passive_only(device_ip.ip, passive_nets):
+            skipped_passive += 1
+            continue
+        tasks.append({
             "device_id": device.id,
             "device_display": device.display_name,
             "ip": device_ip.ip,
             "ports": _get_ports_for_ip(device_ip.ip, enabled_ranges, profile_default_ports),
-        }
-        for device, device_ip in devices_with_ip
-    ]
+        })
+
+    if skipped_passive:
+        logger.info(
+            "Port scan '%d': %d device(s) ignorados (faixa passive_only).",
+            profile_id, skipped_passive,
+        )
+    return tasks
 
 
 def _next_alternate_nmap_args(device_id: int) -> str:
@@ -938,6 +1015,13 @@ def prepend_to_port_scan_queue(profile_id: int, device_id: int, device_display: 
         _profile = _db.session.get(Profile, profile_id)
         _profile_default_ports = (_profile.default_ports or "") if _profile else ""
         enabled_ranges = IpRange.query.filter_by(profile_id=profile_id, enabled=True).all()
+        # Smart polling: não enfileira devices de faixas passive_only.
+        if _ip_is_passive_only(ip, _passive_only_nets(enabled_ranges)):
+            logger.info(
+                "Device '%s' (%s) em faixa passive_only — não enfileirado para port scan.",
+                device_display, ip,
+            )
+            return
         ports = _get_ports_for_ip(ip, enabled_ranges, _profile_default_ports)
     except Exception:
         from app.scanner.ports import DEFAULT_PORTS
@@ -1439,16 +1523,21 @@ def _record_detected_open_port(
     return True
 
 
-def _online_devices_with_ip(profile_id: int):
-    """[(Device, DeviceIp)] dos devices online (last_seen dentro do threshold)."""
+def _online_devices_with_ip(profile_id: int, exclude_passive: bool = True):
+    """[(Device, DeviceIp)] dos devices online (last_seen dentro do threshold).
+
+    Com ``exclude_passive`` (padrão), remove devices cujo IP atual está numa
+    faixa passive_only — usado pelos checks ativos (portas críticas, UDP) para
+    respeitar o smart polling.
+    """
     from flask import current_app
 
     from app.extensions import db
-    from app.models import Device, DeviceIp
+    from app.models import Device, DeviceIp, IpRange
 
     online_minutes = current_app.config.get("HOST_ONLINE_THRESHOLD_MINUTES", 70)
     cutoff = _utcnow() - timedelta(minutes=online_minutes)
-    return (
+    rows = (
         db.session.query(Device, DeviceIp)
         .join(DeviceIp, Device.id == DeviceIp.device_id)
         .filter(
@@ -1458,6 +1547,14 @@ def _online_devices_with_ip(profile_id: int):
         )
         .all()
     )
+    if not exclude_passive:
+        return rows
+
+    enabled_ranges = IpRange.query.filter_by(profile_id=profile_id, enabled=True).all()
+    passive_nets = _passive_only_nets(enabled_ranges)
+    if not passive_nets:
+        return rows
+    return [(d, dip) for d, dip in rows if not _ip_is_passive_only(dip.ip, passive_nets)]
 
 
 # ---------------------------------------------------------------------------
@@ -2078,9 +2175,9 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
     # --- SNMP ---
     if "snmp" in scan_types:
         from app.models import Profile
+        from app.scanner.snmp import credential_from_profile
         profile = db.session.get(Profile, device.profile_id)
-        community = profile.snmp_community if profile else "public"
-        snmp_info = get_system_info(ip, community=community)
+        snmp_info = get_system_info(ip, credential=credential_from_profile(profile))
         results["snmp"] = snmp_info
 
     # --- Identificação de dispositivo móvel ---

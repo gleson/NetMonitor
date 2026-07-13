@@ -198,6 +198,7 @@ class Profile(db.Model):
     host_discovery_interval_minutes = db.Column(db.Integer, default=45)
     port_scan_interval_minutes = db.Column(db.Integer, default=4)
     snmp_enabled = db.Column(db.Boolean, default=False)
+    # "2c" (community) ou "3" (USM — usuário + auth/priv).
     snmp_version = db.Column(db.String(10), default="2c")
     # Armazenado cifrado com Fernet quando FERNET_KEY está configurado.
     _snmp_community = db.Column("snmp_community", db.Text, default="public")
@@ -209,6 +210,49 @@ class Profile(db.Model):
     @snmp_community.setter
     def snmp_community(self, value: str) -> None:
         self._snmp_community = _encrypt_str(value or "")
+
+    # --- SNMPv3 (USM) ---
+    # Usuário e chaves são cifrados com Fernet (como a community). Os protocolos
+    # são metadados não sensíveis. O nível de segurança (noAuthNoPriv /
+    # authNoPriv / authPriv) é derivado da presença das chaves em `snmp_v3_level`.
+    _snmp_v3_user = db.Column("snmp_v3_user", db.Text, default="", nullable=False)
+    snmp_v3_auth_protocol = db.Column(db.String(10), default="SHA", nullable=False)
+    _snmp_v3_auth_key = db.Column("snmp_v3_auth_key", db.Text, default="", nullable=False)
+    snmp_v3_priv_protocol = db.Column(db.String(10), default="AES", nullable=False)
+    _snmp_v3_priv_key = db.Column("snmp_v3_priv_key", db.Text, default="", nullable=False)
+
+    @property
+    def snmp_v3_user(self) -> str:
+        return _decrypt_str(self._snmp_v3_user or "")
+
+    @snmp_v3_user.setter
+    def snmp_v3_user(self, value: str) -> None:
+        self._snmp_v3_user = _encrypt_str(value or "")
+
+    @property
+    def snmp_v3_auth_key(self) -> str:
+        return _decrypt_str(self._snmp_v3_auth_key or "")
+
+    @snmp_v3_auth_key.setter
+    def snmp_v3_auth_key(self, value: str) -> None:
+        self._snmp_v3_auth_key = _encrypt_str(value or "")
+
+    @property
+    def snmp_v3_priv_key(self) -> str:
+        return _decrypt_str(self._snmp_v3_priv_key or "")
+
+    @snmp_v3_priv_key.setter
+    def snmp_v3_priv_key(self, value: str) -> None:
+        self._snmp_v3_priv_key = _encrypt_str(value or "")
+
+    @property
+    def snmp_v3_level(self) -> str:
+        """Nível de segurança USM derivado das chaves configuradas."""
+        if self.snmp_v3_auth_key and self.snmp_v3_priv_key:
+            return "authPriv"
+        if self.snmp_v3_auth_key:
+            return "authNoPriv"
+        return "noAuthNoPriv"
     max_concurrent_scans = db.Column(db.Integer, default=3)
     is_active = db.Column(db.Boolean, default=True)
     # --- Notificações de alertas ---
@@ -248,10 +292,16 @@ class IpRange(db.Model):
     enabled = db.Column(db.Boolean, default=True)
     scan_all_ports = db.Column(db.Boolean, default=False)
     custom_ports = db.Column(db.Text, default="")
+    # Smart polling: faixa marcada como "somente descoberta passiva" (ARP/ping)
+    # NÃO recebe port scan ativo. Pensado para segmentos sensíveis (OT/IoT,
+    # impressoras, câmeras) que podem instabilizar sob varredura de portas.
+    passive_only = db.Column(db.Boolean, default=False, nullable=False)
 
     @property
     def ports_display(self):
         """Texto curto descrevendo a config de portas para exibição."""
+        if self.passive_only:
+            return "Passivo (sem port scan)"
         if self.scan_all_ports:
             return "Todas (1-65535)"
         if self.custom_ports:
@@ -554,6 +604,50 @@ class Note(db.Model):
 
     def __repr__(self):
         return f"<Note {self.title}>"
+
+
+# ---------------------------------------------------------------------------
+# SwitchNeighbor — topologia física de camada 2 (LLDP + FDB via SNMP)
+# ---------------------------------------------------------------------------
+
+class SwitchNeighbor(db.Model):
+    """Vizinhança física descoberta em um switch gerenciável via SNMP.
+
+    Preenchido pelo job opcional de topologia (``app/scanner/topology.py``),
+    desligado por padrão. Cada linha associa uma porta física de um switch
+    (``switch_device_id``) a um vizinho — outro switch (via LLDP) ou um
+    endpoint (via BRIDGE-MIB FDB, correlacionando o MAC com um Device).
+    """
+    __tablename__ = "switch_neighbors"
+    __table_args__ = (
+        db.UniqueConstraint(
+            "switch_device_id", "local_port", "remote_mac",
+            name="uq_neighbor_switch_port_mac",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    profile_id = db.Column(db.Integer, db.ForeignKey("profiles.id"), nullable=False, index=True)
+    # Device (device_type SWITCH) que reportou esta vizinhança.
+    switch_device_id = db.Column(db.Integer, db.ForeignKey("devices.id"), nullable=False, index=True)
+    # Porta física local do switch (nome LLDP ou ifIndex da FDB).
+    local_port = db.Column(db.String(120), default="", nullable=False)
+    # Identidade do vizinho.
+    remote_mac = db.Column(db.String(17), default="", nullable=False)
+    remote_name = db.Column(db.String(255), default="", nullable=False)  # sysName LLDP
+    remote_port = db.Column(db.String(120), default="", nullable=False)  # portId LLDP
+    # Device correlacionado ao remote_mac neste perfil (quando existe).
+    remote_device_id = db.Column(db.Integer, db.ForeignKey("devices.id"), nullable=True)
+    # "lldp" (switch↔switch) ou "fdb" (endpoint via forwarding database).
+    source = db.Column(db.String(10), default="fdb", nullable=False)
+    first_seen_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    last_seen_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    switch_device = db.relationship("Device", foreign_keys=[switch_device_id])
+    remote_device = db.relationship("Device", foreign_keys=[remote_device_id])
+
+    def __repr__(self):
+        return f"<SwitchNeighbor switch={self.switch_device_id} port={self.local_port} mac={self.remote_mac}>"
 
 
 # ---------------------------------------------------------------------------

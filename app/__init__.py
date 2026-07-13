@@ -283,3 +283,11 @@ def _init_scheduler(app: Flask):
 
     scheduler.start()
     app.logger.info("APScheduler iniciado com sucesso.")
+
+    # Descoberta passiva por sniffing de ARP — só no processo dono do scheduler
+    # (o mesmo lock garante processo único). No-op se desabilitada ou sem root.
+    try:
+        from app.scanner.passive import start_passive_discovery
+        start_passive_discovery(app)
+    except Exception:
+        app.logger.exception("Falha ao iniciar a descoberta passiva.")

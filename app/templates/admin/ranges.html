@@ -27,7 +27,9 @@
                             <td><code>{{ r.cidr }}</code></td>
                             <td>{{ r.description or '-' }}</td>
                             <td>
-                                {% if r.scan_all_ports %}
+                                {% if r.passive_only %}
+                                <span class="badge bg-warning text-dark" title="Somente descoberta passiva (ARP/ping), sem port scan">Passivo</span>
+                                {% elif r.scan_all_ports %}
                                 <span class="badge bg-danger">Todas</span>
                                 {% elif r.custom_ports %}
                                 <span class="badge bg-info text-dark" title="{{ r.custom_ports }}">Personalizado</span>
@@ -100,6 +102,11 @@
                         <input type="text" name="custom_ports" class="form-control form-control-sm mt-2" id="customPortsInput"
                                placeholder="Ex: 22,80,443,8080 ou 1-1024" disabled>
                         <small class="text-muted">Separar por vírgula ou usar ranges (ex: 1-1024,8080,8443)</small>
+                        <div class="form-check mt-2">
+                            <input type="radio" name="port_mode" value="passive" class="form-check-input" id="portPassive">
+                            <label class="form-check-label" for="portPassive">Somente passivo <small class="text-warning">(sem port scan)</small></label>
+                        </div>
+                        <small class="text-muted">Descoberta por ARP/ping apenas. Ideal para OT/IoT, impressoras e câmeras sensíveis a varredura.</small>
                     </div>
                     <div class="form-check form-switch mb-3">
                         <input type="checkbox" name="enabled" class="form-check-input" id="rangeEnabled" checked>

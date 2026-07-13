@@ -31,7 +31,7 @@
                         <label class="form-label">Portas para Port Scan</label>
                         <div class="form-check">
                             <input type="radio" name="port_mode" value="default" class="form-check-input" id="portDefault"
-                                   {% if not ip_range.scan_all_ports and not ip_range.custom_ports %}checked{% endif %}>
+                                   {% if not ip_range.scan_all_ports and not ip_range.custom_ports and not ip_range.passive_only %}checked{% endif %}>
                             <label class="form-check-label" for="portDefault">Padrão (portas comuns)</label>
                         </div>
                         <div class="form-check">
@@ -49,6 +49,12 @@
                                placeholder="Ex: 22,80,443,8080 ou 1-1024"
                                {% if ip_range.scan_all_ports or not ip_range.custom_ports %}disabled{% endif %}>
                         <small class="text-muted">Separar por vírgula ou usar ranges (ex: 1-1024,8080,8443)</small>
+                        <div class="form-check mt-2">
+                            <input type="radio" name="port_mode" value="passive" class="form-check-input" id="portPassive"
+                                   {% if ip_range.passive_only %}checked{% endif %}>
+                            <label class="form-check-label" for="portPassive">Somente passivo <small class="text-warning">(sem port scan)</small></label>
+                        </div>
+                        <small class="text-muted">Descoberta por ARP/ping apenas. Ideal para OT/IoT, impressoras e câmeras sensíveis a varredura.</small>
                     </div>
                     <div class="form-check form-switch mb-3">
                         <input type="checkbox" name="enabled" class="form-check-input" id="rangeEnabled"

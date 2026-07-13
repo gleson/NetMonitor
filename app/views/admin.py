@@ -41,6 +41,37 @@ def _clean_min_severity(value: str | None) -> str:
     return value if value in ("INFO", "WARNING", "CRITICAL") else "CRITICAL"
 
 
+_SNMP_AUTH_PROTOCOLS = ("MD5", "SHA", "SHA224", "SHA256", "SHA384", "SHA512")
+_SNMP_PRIV_PROTOCOLS = ("DES", "AES", "AES192", "AES256")
+
+
+def _apply_snmp_fields(profile, form) -> None:
+    """Lê os campos SNMP (v2c/v3) do formulário e os aplica ao profile.
+
+    As chaves v3 só são sobrescritas quando o campo vem preenchido — assim
+    reeditar o perfil sem redigitar segredos não os apaga (os inputs de senha
+    vêm vazios por segurança).
+    """
+    profile.snmp_enabled = "snmp_enabled" in form
+    version = (form.get("snmp_version", "2c") or "2c").strip()
+    profile.snmp_version = "3" if version in ("3", "v3") else "2c"
+    profile.snmp_community = form.get("snmp_community", "public")
+
+    profile.snmp_v3_user = form.get("snmp_v3_user", "").strip()
+    auth_proto = (form.get("snmp_v3_auth_protocol", "SHA") or "SHA").upper()
+    profile.snmp_v3_auth_protocol = auth_proto if auth_proto in _SNMP_AUTH_PROTOCOLS else "SHA"
+    priv_proto = (form.get("snmp_v3_priv_protocol", "AES") or "AES").upper()
+    profile.snmp_v3_priv_protocol = priv_proto if priv_proto in _SNMP_PRIV_PROTOCOLS else "AES"
+
+    # Chaves: só grava se veio algo (preserva o segredo existente quando vazio).
+    auth_key = form.get("snmp_v3_auth_key", "")
+    if auth_key:
+        profile.snmp_v3_auth_key = auth_key
+    priv_key = form.get("snmp_v3_priv_key", "")
+    if priv_key:
+        profile.snmp_v3_priv_key = priv_key
+
+
 # ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
@@ -66,13 +97,12 @@ def profile_new():
             host_discovery_interval_minutes=int(request.form.get("host_discovery_interval", 45)),
             port_scan_interval_minutes=int(request.form.get("port_scan_interval", 4)),
             max_concurrent_scans=int(request.form.get("max_concurrent_scans", 3)),
-            snmp_enabled="snmp_enabled" in request.form,
-            snmp_community=request.form.get("snmp_community", "public"),
             webhook_url=request.form.get("webhook_url", "").strip(),
             notify_email=request.form.get("notify_email", "").strip(),
             notify_min_severity=_clean_min_severity(request.form.get("notify_min_severity")),
             default_ports=request.form.get("default_ports", "").strip(),
         )
+        _apply_snmp_fields(profile, request.form)
         db.session.add(profile)
         db.session.flush()
         audit("profile.create", "profile", profile.id, details=profile.name)
@@ -99,8 +129,7 @@ def profile_edit(profile_id):
         profile.host_discovery_interval_minutes = int(request.form.get("host_discovery_interval", 45))
         profile.port_scan_interval_minutes = int(request.form.get("port_scan_interval", 4))
         profile.max_concurrent_scans = int(request.form.get("max_concurrent_scans", 3))
-        profile.snmp_enabled = "snmp_enabled" in request.form
-        profile.snmp_community = request.form.get("snmp_community", "public")
+        _apply_snmp_fields(profile, request.form)
         profile.is_active = "is_active" in request.form
         profile.webhook_url = request.form.get("webhook_url", "").strip()
         profile.notify_email = request.form.get("notify_email", "").strip()
@@ -171,6 +200,7 @@ def range_new(profile_id):
         enabled="enabled" in request.form or not request.form.get("enabled_field"),
         scan_all_ports=(port_mode == "all"),
         custom_ports=custom_ports if port_mode == "custom" else "",
+        passive_only=(port_mode == "passive"),
     )
     db.session.add(ip_range)
     db.session.flush()
@@ -222,6 +252,7 @@ def range_edit(range_id):
             request.form.get("custom_ports", "").strip()
             if port_mode == "custom" else ""
         )
+        ip_range.passive_only = (port_mode == "passive")
 
         audit("range.update", "ip_range", ip_range.id, details=ip_range.cidr)
         db.session.commit()
@@ -511,6 +542,8 @@ def user_delete(user_id):
 # ---------------------------------------------------------------------------
 
 QUICK_CHECK_KEY = "host_down_quick_check_interval"
+PASSIVE_ARP_KEY = "passive_arp_enabled"
+TOPOLOGY_KEY = "topology_lldp_enabled"
 
 
 @admin_bp.route("/scan-settings", methods=["GET", "POST"])
@@ -519,10 +552,12 @@ QUICK_CHECK_KEY = "host_down_quick_check_interval"
 def scan_settings():
     """Painel de ajustes globais de scan editáveis em runtime.
 
-    Hoje expõe somente o intervalo do quick check de HOST_DOWN; novas chaves
-    podem ser adicionadas aqui sem migration.
+    Expõe o intervalo do quick check de HOST_DOWN e os interruptores de
+    descoberta passiva (ARP) e topologia L2 (LLDP/FDB). Novas chaves podem ser
+    adicionadas aqui sem migration (AppSetting).
     """
     from flask import current_app
+    app_obj = current_app._get_current_object()
 
     default_quick = int(current_app.config.get("HOST_DOWN_QUICK_CHECK_INTERVAL_MINUTES", 5))
 
@@ -537,23 +572,51 @@ def scan_settings():
             flash("Intervalo deve estar entre 1 e 60 minutos.", "danger")
             return redirect(url_for("admin.scan_settings"))
 
+        passive_enabled = "passive_arp_enabled" in request.form
+        topology_enabled = "topology_lldp_enabled" in request.form
+        prev_passive = AppSetting.get_value(PASSIVE_ARP_KEY, "") in ("1", "true", "True", "on")
+        prev_topology = AppSetting.get_value(TOPOLOGY_KEY, "") in ("1", "true", "True", "on")
+
         AppSetting.set_value(QUICK_CHECK_KEY, new_interval)
+        AppSetting.set_value(PASSIVE_ARP_KEY, "1" if passive_enabled else "0")
+        AppSetting.set_value(TOPOLOGY_KEY, "1" if topology_enabled else "0")
         audit("scan_settings.update", "app_setting", None,
-              details=f"{QUICK_CHECK_KEY}={new_interval}")
+              details=(f"{QUICK_CHECK_KEY}={new_interval} "
+                       f"{PASSIVE_ARP_KEY}={passive_enabled} {TOPOLOGY_KEY}={topology_enabled}"))
         db.session.commit()
 
         # Reagenda os jobs de host-down nos perfis ativos
-        from app.scanner.scheduling import sync_quick_host_down_jobs
-        sync_quick_host_down_jobs(current_app._get_current_object())
+        from app.scanner.scheduling import sync_quick_host_down_jobs, sync_topology_jobs
+        sync_quick_host_down_jobs(app_obj)
 
-        flash(f"Intervalo do quick check atualizado para {new_interval} min.", "success")
+        # Aplica mudanças de estado dos recursos opcionais.
+        if passive_enabled != prev_passive:
+            from app.scanner.passive import restart_passive_discovery
+            restart_passive_discovery(app_obj)
+        if topology_enabled != prev_topology:
+            sync_topology_jobs(app_obj)
+
+        flash(f"Configurações de scan atualizadas (quick check {new_interval} min).", "success")
         return redirect(url_for("admin.scan_settings"))
 
     quick_check_interval = AppSetting.get_int(QUICK_CHECK_KEY, default_quick)
+
+    from app.scanner.passive import is_passive_discovery_enabled, is_passive_discovery_running
+    from app.scanner.topology import is_topology_enabled
+    import os
+    try:
+        has_root = os.geteuid() == 0
+    except AttributeError:
+        has_root = False
+
     return render_template(
         "admin/scan_settings.html",
         quick_check_interval=quick_check_interval,
         default_quick=default_quick,
+        passive_enabled=is_passive_discovery_enabled(app_obj),
+        passive_running=is_passive_discovery_running(),
+        topology_enabled=is_topology_enabled(app_obj),
+        has_root=has_root,
     )
 
 
@@ -617,6 +680,44 @@ def metrics_settings():
         scrape_url=scrape_url,
         metric_defs=_PROM_METRICS,
         stats_by_profile=stats_by_profile,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Topologia física de camada 2 (LLDP + FDB)
+# ---------------------------------------------------------------------------
+
+@admin_bp.route("/topology")
+@login_required
+@require_role(ROLE_ADMIN)
+def topology():
+    """Exibe a topologia L2 descoberta: por switch, quais vizinhos/portas."""
+    from app.models import Device, SwitchNeighbor
+
+    profile_id = request.args.get("profile_id", type=int)
+    profiles = Profile.query.filter_by(is_active=True).order_by(Profile.name).all()
+
+    q = SwitchNeighbor.query
+    if profile_id:
+        q = q.filter_by(profile_id=profile_id)
+    neighbors = q.order_by(
+        SwitchNeighbor.switch_device_id, SwitchNeighbor.local_port
+    ).all()
+
+    # Agrupa por switch para a exibição.
+    switches: dict[int, dict] = {}
+    for n in neighbors:
+        grp = switches.setdefault(n.switch_device_id, {
+            "switch": db.session.get(Device, n.switch_device_id),
+            "rows": [],
+        })
+        grp["rows"].append(n)
+
+    return render_template(
+        "admin/topology.html",
+        switches=list(switches.values()),
+        profiles=profiles,
+        selected_profile_id=profile_id,
     )
 
 

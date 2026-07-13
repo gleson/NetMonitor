@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Topologia L2 - NetMonitor{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="{{ url_for('admin.scan_settings') }}">Configurações de Scan</a></li>
+        <li class="breadcrumb-item active">Topologia L2</li>
+    </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-diagram-3"></i> Topologia Física (LLDP + FDB)</h2>
+    <form method="GET" class="d-flex gap-2">
+        <select name="profile_id" class="form-select form-select-sm" onchange="this.form.submit()">
+            <option value="">Todos os perfis</option>
+            {% for p in profiles %}
+            <option value="{{ p.id }}" {{ 'selected' if selected_profile_id == p.id else '' }}>{{ p.name }}</option>
+            {% endfor %}
+        </select>
+    </form>
+</div>
+
+{% if not switches %}
+<div class="alert alert-secondary">
+    Nenhuma vizinhança descoberta ainda. Verifique se há dispositivos do tipo
+    <strong>SWITCH</strong> com SNMP habilitado no perfil e se a topologia está
+    ligada em <a href="{{ url_for('admin.scan_settings') }}">Configurações de Scan</a>.
+    O job roda periodicamente — aguarde o próximo ciclo.
+</div>
+{% else %}
+{% for grp in switches %}
+<div class="card bg-dark border-secondary mb-3">
+    <div class="card-header">
+        <i class="bi bi-hdd-network"></i>
+        {% if grp.switch %}
+        <a href="{{ url_for('devices.device_detail', device_id=grp.switch.id) }}" class="text-decoration-none">
+            {{ grp.switch.display_name }}
+        </a>
+        <small class="text-muted">({{ grp.switch.current_ip or grp.switch.mac }})</small>
+        {% else %}
+        Switch #{{ grp.rows[0].switch_device_id }}
+        {% endif %}
+    </div>
+    <div class="card-body">
+        <table class="table table-dark table-sm table-striped mb-0">
+            <thead>
+                <tr>
+                    <th>Porta local</th>
+                    <th>Origem</th>
+                    <th>Vizinho</th>
+                    <th>MAC / Porta remota</th>
+                    <th>Visto por último</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for n in grp.rows %}
+                <tr>
+                    <td><code>{{ n.local_port or '-' }}</code></td>
+                    <td>
+                        {% if n.source == 'lldp' %}
+                        <span class="badge bg-info text-dark">LLDP</span>
+                        {% else %}
+                        <span class="badge bg-secondary">FDB</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if n.remote_device_id %}
+                        <a href="{{ url_for('devices.device_detail', device_id=n.remote_device_id) }}">
+                            {{ n.remote_name or n.remote_mac }}
+                        </a>
+                        {% else %}
+                        {{ n.remote_name or n.remote_mac or '-' }}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if n.remote_mac %}<code>{{ n.remote_mac }}</code>{% endif %}
+                        {% if n.remote_port %}<small class="text-muted">{{ n.remote_port }}</small>{% endif %}
+                    </td>
+                    <td><small>{{ n.last_seen_at | localtime }}</small></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

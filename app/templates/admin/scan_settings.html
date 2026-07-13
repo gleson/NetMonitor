@@ -28,6 +28,43 @@
                 </div>
             </div>
 
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-broadcast"></i> Descoberta passiva (ARP)</h6>
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="passive_arp_enabled" class="form-check-input" id="passiveArp"
+                       {% if passive_enabled %}checked{% endif %} {% if not has_root %}disabled{% endif %}>
+                <label class="form-check-label" for="passiveArp">
+                    Escutar tráfego ARP para detectar dispositivos novos em segundos
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Complementa o discovery ativo sem gerar tráfego — ideal para ativos sensíveis (OT/IoT).
+                {% if not has_root %}
+                <span class="text-warning d-block">Requer executar o app como root (sniff usa raw sockets). Indisponível no momento.</span>
+                {% elif passive_enabled and not passive_running %}
+                <span class="text-warning d-block">Habilitada mas não está rodando — verifique os logs.</span>
+                {% elif passive_running %}
+                <span class="text-success d-block"><i class="bi bi-check-circle"></i> Sniffer ativo.</span>
+                {% endif %}
+            </div>
+
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-diagram-3"></i> Topologia física (LLDP + FDB)</h6>
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="topology_lldp_enabled" class="form-check-input" id="topologyLldp"
+                       {% if topology_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="topologyLldp">
+                    Mapear em qual porta de switch cada dispositivo está conectado
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Requer switches gerenciáveis com SNMP habilitado no perfil. Consulta LLDP-MIB e
+                BRIDGE-MIB (FDB) periodicamente. Sem switches gerenciáveis, mantenha desligado.
+                {% if topology_enabled %}
+                <a href="{{ url_for('admin.topology') }}" class="d-block">Ver mapa de topologia →</a>
+                {% endif %}
+            </div>
+
             <button type="submit" class="btn btn-primary">
                 <i class="bi bi-save"></i> Salvar
             </button>

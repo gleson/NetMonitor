@@ -1,0 +1,362 @@
+"""Descoberta passiva de dispositivos por sniffing de ARP.
+
+Complementa o host discovery ativo (ARP/nmap a cada ~45 min): escutando o
+tráfego ARP da sub-rede em background, um dispositivo novo aparece em segundos
+em vez de esperar o próximo ciclo. Também atende ativos sensíveis (OT/IoT) que
+não toleram varredura ativa — aqui só observamos pacotes que eles já emitem.
+
+Requisitos e travas:
+- Precisa de root (sniff usa raw sockets) — sem root, não inicia.
+- Desligado por padrão. Ligado via ``AppSetting('passive_arp_enabled')`` ou
+  ``PASSIVE_ARP_DISCOVERY_ENABLED`` na config.
+- Iniciado apenas no processo dono do scheduler (ver app/__init__.py), então
+  não duplica sob múltiplos workers do gunicorn.
+
+Arquitetura: um ``AsyncSniffer`` do scapy empurra (ip, mac) para um buffer
+com debounce; um thread worker drena o buffer periodicamente e faz o upsert
+no banco dentro de um app_context próprio.
+"""
+
+import ipaddress
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+# Estado do módulo (processo único — dono do scheduler).
+_sniffer = None
+_worker_thread: threading.Thread | None = None
+_stop_event: threading.Event | None = None
+_app = None
+
+# Buffer de observações pendentes: mac -> (ip, first_seen_monotonic).
+# Protegido por _buffer_lock. O callback do sniffer (thread do scapy) só
+# escreve aqui; o worker lê e limpa.
+_buffer: dict[str, str] = {}
+_buffer_lock = threading.Lock()
+
+# Cooldown por MAC: evita reprocessar o mesmo host repetidamente (ARP é
+# frequente). mac -> monotonic da última ingestão.
+_recent_macs: dict[str, float] = {}
+_INGEST_COOLDOWN_S = 60.0
+
+# Intervalo do worker que drena o buffer.
+_WORKER_INTERVAL_S = 5.0
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _has_root() -> bool:
+    import os
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def is_passive_discovery_enabled(app) -> bool:
+    """Lê a flag efetiva (AppSetting tem prioridade sobre a config)."""
+    default = bool(app.config.get("PASSIVE_ARP_DISCOVERY_ENABLED", False))
+    try:
+        from app.models import AppSetting
+        raw = AppSetting.get_value("passive_arp_enabled", "")
+        if raw == "":
+            return default
+        return raw in ("1", "true", "True", "on")
+    except Exception:
+        logger.debug("Falha ao ler AppSetting passive_arp_enabled — usando default.", exc_info=True)
+        return default
+
+
+def is_passive_discovery_running() -> bool:
+    return _sniffer is not None
+
+
+# ---------------------------------------------------------------------------
+# Sniffer
+# ---------------------------------------------------------------------------
+
+def _on_arp_packet(pkt):
+    """Callback do sniffer (thread do scapy). Mantém-se mínimo: só bufferiza."""
+    try:
+        from scapy.layers.l2 import ARP
+        if not pkt.haslayer(ARP):
+            return
+        arp = pkt[ARP]
+        ip = arp.psrc
+        mac = (arp.hwsrc or "").upper()
+        # Ignora endereços nulos/broadcast e MAC inválido — validação forte
+        # acontece na ingestão.
+        if not ip or ip == "0.0.0.0" or not mac or mac == "00:00:00:00:00:00":
+            return
+        with _buffer_lock:
+            _buffer[mac] = ip
+    except Exception:
+        # Nunca deixa uma exceção escapar do callback do sniffer.
+        logger.debug("Erro ao processar pacote ARP", exc_info=True)
+
+
+def _drain_buffer() -> list[tuple[str, str]]:
+    """Retorna e limpa as observações pendentes, aplicando o cooldown por MAC."""
+    now = time.monotonic()
+    with _buffer_lock:
+        pending = list(_buffer.items())
+        _buffer.clear()
+
+    fresh: list[tuple[str, str]] = []
+    for mac, ip in pending:
+        last = _recent_macs.get(mac, 0.0)
+        if now - last < _INGEST_COOLDOWN_S:
+            continue
+        _recent_macs[mac] = now
+        fresh.append((ip, mac))
+
+    # Poda o dict de cooldown para não crescer sem limite.
+    if len(_recent_macs) > 4096:
+        cutoff = now - _INGEST_COOLDOWN_S
+        for k in [k for k, v in _recent_macs.items() if v < cutoff]:
+            _recent_macs.pop(k, None)
+
+    return fresh
+
+
+def _worker_loop(app, stop_event: threading.Event):
+    """Drena o buffer e ingere no banco periodicamente."""
+    logger.info("Worker de descoberta passiva iniciado.")
+    while not stop_event.is_set():
+        stop_event.wait(_WORKER_INTERVAL_S)
+        if stop_event.is_set():
+            break
+        fresh = _drain_buffer()
+        if not fresh:
+            continue
+        try:
+            with app.app_context():
+                _ingest_observations(fresh)
+        except Exception:
+            logger.exception("Erro ao ingerir observações passivas")
+    logger.info("Worker de descoberta passiva encerrado.")
+
+
+# ---------------------------------------------------------------------------
+# Ingestão no banco
+# ---------------------------------------------------------------------------
+
+def _build_profile_range_index():
+    """Retorna [(profile, [ip_network,...])] dos perfis ativos com ranges habilitados.
+
+    Usado para mapear cada IP observado ao perfil correto.
+    """
+    from app.models import Profile, IpRange
+
+    index = []
+    for profile in Profile.query.filter_by(is_active=True).all():
+        nets = []
+        for r in IpRange.query.filter_by(profile_id=profile.id, enabled=True).all():
+            try:
+                nets.append(ipaddress.ip_network(r.cidr, strict=False))
+            except ValueError:
+                continue
+        if nets:
+            index.append((profile, nets))
+    return index
+
+
+def _match_profile(ip_str: str, index):
+    """Primeiro perfil cujo range habilitado contém o IP, ou None."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    for profile, nets in index:
+        if any(addr in n for n in nets):
+            return profile
+    return None
+
+
+def _ingest_observations(observations: list[tuple[str, str]]):
+    """Cria/atualiza devices a partir de observações ARP (ip, mac)."""
+    from app.extensions import db
+    from app.models import Device, DeviceIp, Alert, AlertType, Severity
+    from app.scanner.hosts import normalize_mac, is_valid_mac, get_vendor_from_mac
+    from app.scanner.scheduling import (
+        prepend_to_port_scan_queue, _ack_open_host_down_alerts, _maybe_notify,
+    )
+
+    index = _build_profile_range_index()
+    if not index:
+        return
+
+    new_count = 0
+    for ip, raw_mac in observations:
+        mac = normalize_mac(raw_mac)
+        if not is_valid_mac(mac):
+            continue
+        profile = _match_profile(ip, index)
+        if profile is None:
+            continue  # IP fora de qualquer range monitorado
+
+        now = _utcnow()
+        device = Device.query.filter_by(profile_id=profile.id, mac=mac).first()
+
+        if device is None:
+            # Um placeholder pode existir para este IP (descoberto sem MAC real).
+            dip = DeviceIp.query.filter_by(ip=ip, is_current=True).first()
+            if dip:
+                placeholder = db.session.get(Device, dip.device_id)
+                if (placeholder and placeholder.profile_id == profile.id
+                        and placeholder.mac.startswith("02:00:")):
+                    placeholder.mac = mac
+                    if not placeholder.vendor:
+                        placeholder.vendor = get_vendor_from_mac(mac)
+                    device = placeholder
+
+        if device is None:
+            # Dispositivo novo — descoberto passivamente.
+            device = Device(
+                profile_id=profile.id,
+                mac=mac,
+                vendor=get_vendor_from_mac(mac),
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+            device.record_online_today(now.date())
+            db.session.add(device)
+            db.session.flush()
+
+            new_dev_alert = Alert(
+                profile_id=profile.id,
+                device_id=device.id,
+                alert_type=AlertType.NEW_DEVICE,
+                severity=Severity.INFO,
+                message=f"Novo dispositivo (descoberta passiva ARP): {mac} ({ip})",
+            )
+            db.session.add(new_dev_alert)
+            _maybe_notify(new_dev_alert, profile, device)
+            new_count += 1
+            logger.info("Descoberta passiva: novo device %s (%s)", mac, ip)
+
+            db.session.add(DeviceIp(
+                device_id=device.id, ip=ip,
+                first_seen_at=now, last_seen_at=now, is_current=True,
+            ))
+            db.session.commit()
+
+            # Enfileira para port scan (a própria fila respeita passive_only).
+            prepend_to_port_scan_queue(profile.id, device.id, device.display_name, ip)
+            continue
+
+        # Dispositivo existente — atualiza presença.
+        device.last_seen_at = now
+        device.record_online_today(now.date())
+        _ack_open_host_down_alerts(device.id, now)
+
+        current_ip = DeviceIp.query.filter_by(device_id=device.id, is_current=True).first()
+        if current_ip is None:
+            db.session.add(DeviceIp(
+                device_id=device.id, ip=ip,
+                first_seen_at=now, last_seen_at=now, is_current=True,
+            ))
+        elif current_ip.ip != ip:
+            current_ip.is_current = False
+            current_ip.last_seen_at = now
+            db.session.add(DeviceIp(
+                device_id=device.id, ip=ip,
+                first_seen_at=now, last_seen_at=now, is_current=True,
+            ))
+            alert = Alert(
+                profile_id=profile.id,
+                device_id=device.id,
+                alert_type=AlertType.NEW_IP_FOR_MAC,
+                severity=Severity.WARNING,
+                message=f"Device {device.display_name} ({mac}) mudou de IP (ARP passivo): {current_ip.ip} -> {ip}",
+            )
+            db.session.add(alert)
+            _maybe_notify(alert, profile, device)
+        else:
+            current_ip.last_seen_at = now
+
+        db.session.commit()
+
+    if new_count:
+        logger.info("Descoberta passiva: %d novo(s) device(s) nesta rodada.", new_count)
+
+
+# ---------------------------------------------------------------------------
+# Ciclo de vida
+# ---------------------------------------------------------------------------
+
+def start_passive_discovery(app) -> bool:
+    """Inicia o sniffer + worker se habilitado e com root. Idempotente.
+
+    Returns:
+        True se ficou rodando (ou já rodava), False se não iniciou.
+    """
+    global _sniffer, _worker_thread, _stop_event, _app
+
+    if _sniffer is not None:
+        return True
+
+    if not is_passive_discovery_enabled(app):
+        logger.info("Descoberta passiva desabilitada — não iniciada.")
+        return False
+
+    if not _has_root():
+        logger.warning("Descoberta passiva requer root (sniff ARP) — não iniciada.")
+        return False
+
+    try:
+        from scapy.all import AsyncSniffer
+    except Exception:
+        logger.warning("scapy indisponível — descoberta passiva não iniciada.", exc_info=True)
+        return False
+
+    _app = app
+    _stop_event = threading.Event()
+    _worker_thread = threading.Thread(
+        target=_worker_loop, args=(app, _stop_event),
+        name="passive-arp-worker", daemon=True,
+    )
+    _worker_thread.start()
+
+    try:
+        _sniffer = AsyncSniffer(filter="arp", prn=_on_arp_packet, store=False)
+        _sniffer.start()
+    except Exception:
+        logger.exception("Falha ao iniciar o sniffer ARP — abortando descoberta passiva.")
+        _stop_event.set()
+        _sniffer = None
+        return False
+
+    logger.info("Descoberta passiva ARP iniciada (sniffer + worker).")
+    return True
+
+
+def stop_passive_discovery() -> None:
+    """Para o sniffer e o worker. Idempotente."""
+    global _sniffer, _worker_thread, _stop_event
+
+    if _sniffer is not None:
+        try:
+            _sniffer.stop()
+        except Exception:
+            logger.debug("Erro ao parar o sniffer ARP", exc_info=True)
+        _sniffer = None
+
+    if _stop_event is not None:
+        _stop_event.set()
+    _worker_thread = None
+    logger.info("Descoberta passiva ARP parada.")
+
+
+def restart_passive_discovery(app) -> bool:
+    """Reaplica o estado da flag: para se estava rodando e reinicia conforme config.
+
+    Chamado quando o admin alterna a configuração em runtime.
+    """
+    stop_passive_discovery()
+    return start_passive_discovery(app)

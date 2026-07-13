@@ -45,6 +45,7 @@
                     </div>
 
                     <hr class="border-secondary my-4">
+                    <h6 class="text-muted mb-3"><i class="bi bi-diagram-3"></i> SNMP</h6>
 
                     <div class="row g-3">
                         <div class="col-md-4">
@@ -55,11 +56,69 @@
                             </div>
                         </div>
                         <div class="col-md-4">
-                            <label class="form-label">Community SNMP</label>
+                            <label class="form-label">Versão</label>
+                            {% set cur_ver = profile.snmp_version if profile else '2c' %}
+                            <select name="snmp_version" class="form-select" id="snmpVersion">
+                                <option value="2c" {{ 'selected' if cur_ver != '3' else '' }}>v2c (community)</option>
+                                <option value="3" {{ 'selected' if cur_ver == '3' else '' }}>v3 (USM — autenticação/criptografia)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Campos v2c -->
+                    <div class="row g-3 mt-1 snmp-v2c-fields">
+                        <div class="col-md-6">
+                            <label class="form-label">Community SNMP (v2c)</label>
                             <input type="text" name="snmp_community" class="form-control"
                                    value="{{ profile.snmp_community if profile else 'public' }}"
                                    autocomplete="off">
-                            <div class="form-text text-muted">Cifrada no banco quando <code>FERNET_KEY</code> está configurado.</div>
+                            <div class="form-text text-muted">Cifrada no banco quando <code>FERNET_KEY</code> está configurado. Trafega em texto claro na rede — prefira v3 fora de redes isoladas.</div>
+                        </div>
+                    </div>
+
+                    <!-- Campos v3/USM -->
+                    <div class="snmp-v3-fields">
+                        <div class="row g-3 mt-1">
+                            <div class="col-md-6">
+                                <label class="form-label">Usuário (v3)</label>
+                                <input type="text" name="snmp_v3_user" class="form-control" autocomplete="off"
+                                       value="{{ profile.snmp_v3_user if profile else '' }}">
+                            </div>
+                        </div>
+                        <div class="row g-3 mt-1">
+                            <div class="col-md-3">
+                                <label class="form-label">Protocolo de autenticação</label>
+                                {% set cur_auth = profile.snmp_v3_auth_protocol if profile else 'SHA' %}
+                                <select name="snmp_v3_auth_protocol" class="form-select">
+                                    {% for p in ['MD5','SHA','SHA224','SHA256','SHA384','SHA512'] %}
+                                    <option value="{{ p }}" {{ 'selected' if cur_auth == p else '' }}>{{ p }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Senha de autenticação</label>
+                                <input type="password" name="snmp_v3_auth_key" class="form-control" autocomplete="new-password"
+                                       placeholder="{{ '•••••• (mantém atual)' if profile and profile.snmp_v3_auth_key else 'em branco = noAuth' }}">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Protocolo de privacidade</label>
+                                {% set cur_priv = profile.snmp_v3_priv_protocol if profile else 'AES' %}
+                                <select name="snmp_v3_priv_protocol" class="form-select">
+                                    {% for p in ['DES','AES','AES192','AES256'] %}
+                                    <option value="{{ p }}" {{ 'selected' if cur_priv == p else '' }}>{{ p }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Senha de privacidade</label>
+                                <input type="password" name="snmp_v3_priv_key" class="form-control" autocomplete="new-password"
+                                       placeholder="{{ '•••••• (mantém atual)' if profile and profile.snmp_v3_priv_key else 'em branco = noPriv' }}">
+                            </div>
+                        </div>
+                        <div class="form-text text-muted mt-1">
+                            Nível de segurança derivado das senhas: sem senha de autenticação → <code>noAuthNoPriv</code>;
+                            só autenticação → <code>authNoPriv</code>; ambas → <code>authPriv</code>.
+                            Usuário e senhas são cifrados no banco quando <code>FERNET_KEY</code> está configurado.
                         </div>
                     </div>
 
@@ -134,4 +193,23 @@
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const versionSel = document.getElementById('snmpVersion');
+    const v2c = document.querySelectorAll('.snmp-v2c-fields');
+    const v3 = document.querySelectorAll('.snmp-v3-fields');
+    function sync() {
+        const isV3 = versionSel.value === '3';
+        v2c.forEach(el => el.style.display = isV3 ? 'none' : '');
+        v3.forEach(el => el.style.display = isV3 ? '' : 'none');
+    }
+    if (versionSel) {
+        versionSel.addEventListener('change', sync);
+        sync();
+    }
+});
+</script>
 {% endblock %}

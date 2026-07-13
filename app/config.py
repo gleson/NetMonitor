@@ -152,6 +152,21 @@ class Config:
     METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "0") == "1"
     METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "")
 
+    # --- Descoberta passiva por sniffing de ARP ---
+    # Escuta o tráfego ARP da sub-rede em background para detectar dispositivos
+    # novos em segundos (complementa o discovery ativo). Requer root. Desligada
+    # por padrão; pode ser ligada em runtime via /admin/scan-settings
+    # (AppSetting 'passive_arp_enabled').
+    PASSIVE_ARP_DISCOVERY_ENABLED = os.environ.get("PASSIVE_ARP_DISCOVERY_ENABLED", "0") == "1"
+
+    # --- Topologia física de camada 2 (LLDP + FDB via SNMP) ---
+    # Job opcional que mapeia em qual porta de switch cada ativo está conectado,
+    # correlacionando LLDP-MIB e BRIDGE-MIB (FDB) dos devices do tipo SWITCH.
+    # Requer switches gerenciáveis com SNMP. Desligado por padrão; ligável em
+    # runtime via /admin/scan-settings (AppSetting 'topology_lldp_enabled').
+    TOPOLOGY_LLDP_ENABLED = os.environ.get("TOPOLOGY_LLDP_ENABLED", "0") == "1"
+    TOPOLOGY_LLDP_INTERVAL_HOURS = int(os.environ.get("TOPOLOGY_LLDP_INTERVAL_HOURS", 6))
+
     # --- Dedupe de alertas de porta ---
     # Não re-emite o mesmo alerta (device+porta) dentro desta janela, evitando
     # spam quando o estado oscila (flapping filtered<->open).
