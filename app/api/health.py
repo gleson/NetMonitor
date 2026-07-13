@@ -65,10 +65,12 @@ def prometheus_metrics():
     cartões do dashboard) para nunca divergir. Sem login — protegido por token
     opcional (METRICS_TOKEN) para não vazar contagens da rede.
     """
-    if not current_app.config.get("METRICS_ENABLED", False):
+    from app.metrics_settings import is_metrics_enabled, get_metrics_token
+
+    if not is_metrics_enabled():
         return Response("metrics disabled\n", status=404, mimetype="text/plain")
 
-    token = (current_app.config.get("METRICS_TOKEN") or "").strip()
+    token = get_metrics_token()
     if token:
         provided = ""
         auth = request.headers.get("Authorization", "")

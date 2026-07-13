@@ -325,6 +325,65 @@ def test_prometheus_metrics_token_required(app, db, sample_profile):
         app.config["METRICS_TOKEN"] = ""
 
 
+def test_metrics_admin_page_requires_admin(app, db, sample_profile):
+    """A página de métricas é admin-only (operator não acessa)."""
+    # Um único login por teste: o fixture mantém o app context aberto e o
+    # Flask-Login cacheia current_user em g, então dois logins no mesmo teste
+    # se contaminariam.
+    operator = _login_as(app, db, "operator")
+    assert operator.get("/admin/metrics-settings").status_code == 403
+
+
+def test_metrics_admin_page_generates_token(app, db, sample_profile):
+    """O primeiro acesso admin gera um token e o exibe na página."""
+    from app.metrics_settings import get_metrics_token
+
+    admin = _login_as(app, db, "admin")
+    resp = admin.get("/admin/metrics-settings")
+    assert resp.status_code == 200
+    token = get_metrics_token()
+    assert token                       # token gerado automaticamente
+    assert token in resp.get_data(as_text=True)
+
+
+def test_metrics_enable_via_admin_then_scrape(app, db, sample_profile):
+    """Habilitar pela UI faz o endpoint responder; o token gerado é exigido."""
+    from app.metrics_settings import get_metrics_token
+
+    admin = _login_as(app, db, "admin")
+    admin.get("/admin/metrics-settings")            # gera o token
+    token = get_metrics_token()
+    admin.post("/admin/metrics-settings", data={"action": "save", "enabled": "on"})
+
+    client = app.test_client()
+    assert client.get("/api/metrics/prometheus").status_code == 401
+    ok = client.get(f"/api/metrics/prometheus?token={token}")
+    assert ok.status_code == 200
+    assert "netmonitor_devices_total{" in ok.get_data(as_text=True)
+
+
+def test_metrics_clear_token_opens_endpoint(app, db, sample_profile):
+    """Remover o token (via UI) deixa o endpoint aberto quando habilitado."""
+    admin = _login_as(app, db, "admin")
+    admin.get("/admin/metrics-settings")
+    admin.post("/admin/metrics-settings", data={"action": "save", "enabled": "on"})
+    admin.post("/admin/metrics-settings", data={"action": "clear_token"})
+
+    client = app.test_client()
+    assert client.get("/api/metrics/prometheus").status_code == 200
+
+
+def test_metrics_disabled_via_admin_returns_404(app, db, sample_profile):
+    """Salvar desabilitado faz o endpoint voltar a responder 404."""
+    admin = _login_as(app, db, "admin")
+    admin.get("/admin/metrics-settings")
+    admin.post("/admin/metrics-settings", data={"action": "save", "enabled": "on"})
+    admin.post("/admin/metrics-settings", data={"action": "save"})  # sem 'enabled'
+
+    client = app.test_client()
+    assert client.get("/api/metrics/prometheus").status_code == 404
+
+
 def test_port_toggle_authorized_requires_operator(app, db, sample_profile):
     device, port = _make_device_with_port(db, sample_profile)
 

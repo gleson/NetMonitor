@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Métricas Prometheus - NetMonitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-graph-up"></i> Métricas Prometheus</h2>
+    <span class="badge {{ 'bg-success' if enabled else 'bg-secondary' }} align-self-center">
+        {{ 'Habilitado' if enabled else 'Desabilitado' }}
+    </span>
+</div>
+
+<div class="row g-3">
+    <!-- Configuração -->
+    <div class="col-lg-5">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header"><i class="bi bi-sliders"></i> Configuração do endpoint</div>
+            <div class="card-body">
+                <form method="POST" class="mb-3">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="save">
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               id="metricsEnabled" name="enabled" {{ 'checked' if enabled }}>
+                        <label class="form-check-label" for="metricsEnabled">
+                            Expor <code>/api/metrics/prometheus</code>
+                        </label>
+                        <div class="form-text text-muted">
+                            Desligado, o endpoint responde <code>404 metrics disabled</code>.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-sm">
+                        <i class="bi bi-save"></i> Salvar
+                    </button>
+                </form>
+
+                <hr class="border-secondary">
+
+                <label class="form-label">Token de acesso</label>
+                <div class="input-group input-group-sm mb-2">
+                    <input type="text" id="tokenField" class="form-control font-monospace"
+                           value="{{ token }}" readonly>
+                    <button class="btn btn-outline-secondary" type="button" id="copyTokenBtn"
+                            title="Copiar"><i class="bi bi-clipboard"></i></button>
+                </div>
+                <div class="form-text text-muted mb-2">
+                    Enviado no scrape via <code>Authorization: Bearer &lt;token&gt;</code> ou
+                    <code>?token=</code>. Token vazio deixa o endpoint aberto (só recomendado
+                    em rede confiável).
+                </div>
+                <div class="d-flex gap-2">
+                    <form method="POST" class="d-inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="action" value="generate_token">
+                        <button type="submit" class="btn btn-outline-warning btn-sm"
+                                onclick="return confirm('Gerar um novo token invalida o atual em todos os scrapers. Continuar?')">
+                            <i class="bi bi-arrow-repeat"></i> Gerar novo
+                        </button>
+                    </form>
+                    <form method="POST" class="d-inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="action" value="clear_token">
+                        <button type="submit" class="btn btn-outline-danger btn-sm"
+                                onclick="return confirm('Remover o token deixa o endpoint aberto (sem autenticação). Continuar?')">
+                            <i class="bi bi-x-lg"></i> Remover token
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Como coletar -->
+    <div class="col-lg-7">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header"><i class="bi bi-terminal"></i> Como coletar</div>
+            <div class="card-body">
+                <label class="form-label small text-muted">URL do endpoint (metrics_path)</label>
+                <div class="input-group input-group-sm mb-3">
+                    <input type="text" id="scrapeUrl" class="form-control font-monospace"
+                           value="{{ scrape_url }}" readonly>
+                    <button class="btn btn-outline-secondary" type="button" id="copyUrlBtn"
+                            title="Copiar"><i class="bi bi-clipboard"></i></button>
+                </div>
+
+                <label class="form-label small text-muted">Teste rápido (curl)</label>
+                <pre class="bg-black text-light p-2 rounded small mb-3"><code>curl -H "Authorization: Bearer {{ token or '<token>' }}" \
+  {{ scrape_url }}</code></pre>
+
+                <label class="form-label small text-muted">prometheus.yml</label>
+                <pre class="bg-black text-light p-2 rounded small mb-0"><code>scrape_configs:
+  - job_name: netmonitor
+    metrics_path: {{ '/api/metrics/prometheus' }}
+    {% if scrape_url.startswith('https') %}scheme: https
+    {% endif %}static_configs:
+      - targets: ["{{ scrape_url.split('://')[1].split('/')[0] }}"]
+{% if token %}    authorization:
+      type: Bearer
+      credentials: {{ token }}{% endif %}</code></pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Prévia das métricas (renderizada no sistema) -->
+<div class="card bg-dark border-secondary mt-3">
+    <div class="card-header">
+        <i class="bi bi-table"></i> Valores atuais (por perfil)
+        <span class="text-muted small ms-2">— mesma fonte dos cartões do dashboard</span>
+    </div>
+    <div class="card-body p-0">
+        {% if stats_by_profile %}
+        <div class="table-responsive">
+            <table class="table table-dark table-sm table-striped mb-0 align-middle">
+                <thead>
+                    <tr>
+                        <th>Métrica</th>
+                        {% for profile, _stats in stats_by_profile %}
+                        <th class="text-end">{{ profile.name }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for name, help_text, key in metric_defs %}
+                    <tr>
+                        <td>
+                            <code class="text-info">{{ name }}</code>
+                            <div class="text-muted small">{{ help_text }}</div>
+                        </td>
+                        {% for _profile, stats in stats_by_profile %}
+                        <td class="text-end fw-bold">{{ stats[key] }}</td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">Nenhum perfil ativo.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function copyFrom(inputId, btnId) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+        const el = document.getElementById(inputId);
+        navigator.clipboard.writeText(el.value).then(() => {
+            const old = btn.innerHTML;
+            btn.innerHTML = '<i class="bi bi-check-lg"></i>';
+            setTimeout(() => { btn.innerHTML = old; }, 1200);
+        });
+    });
+}
+copyFrom('tokenField', 'copyTokenBtn');
+copyFrom('scrapeUrl', 'copyUrlBtn');
+</script>
+{% endblock %}

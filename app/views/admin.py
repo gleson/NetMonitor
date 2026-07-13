@@ -557,6 +557,69 @@ def scan_settings():
     )
 
 
+# ---------------------------------------------------------------------------
+# Métricas Prometheus (AppSetting)
+# ---------------------------------------------------------------------------
+
+@admin_bp.route("/metrics-settings", methods=["GET", "POST"])
+@login_required
+@require_role(ROLE_ADMIN)
+def metrics_settings():
+    """Habilita/desabilita o endpoint Prometheus, gerencia o token e mostra
+    uma prévia das métricas atuais (por perfil) renderizada no sistema.
+    """
+    from flask import current_app
+    from app.metrics_settings import (
+        is_metrics_enabled, get_metrics_token, set_metrics_enabled,
+        set_metrics_token, generate_metrics_token,
+    )
+    from app.stats import compute_dashboard_stats
+    from app.api.health import _PROM_METRICS
+
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        if action == "generate_token":
+            token = generate_metrics_token()
+            audit("metrics.token_generate", "app_setting", None, details="novo token gerado")
+            db.session.commit()
+            flash("Novo token gerado.", "success")
+        elif action == "clear_token":
+            set_metrics_token("")
+            audit("metrics.token_clear", "app_setting", None, details="token removido (endpoint aberto)")
+            db.session.commit()
+            flash("Token removido — o endpoint fica aberto quando habilitado.", "warning")
+        else:  # save
+            enabled = "enabled" in request.form
+            set_metrics_enabled(enabled)
+            audit("metrics.settings_update", "app_setting", None,
+                  details=f"enabled={enabled}")
+            db.session.commit()
+            flash("Configurações de métricas salvas.", "success")
+        return redirect(url_for("admin.metrics_settings"))
+
+    # Garante que sempre exista um token para copiar (gera no primeiro acesso).
+    token = get_metrics_token()
+    if not token:
+        token = generate_metrics_token()
+        audit("metrics.token_generate", "app_setting", None, details="token inicial gerado")
+        db.session.commit()
+
+    from flask import url_for as _url_for
+    scrape_url = _url_for("api.prometheus_metrics", _external=True)
+
+    profiles = Profile.query.filter_by(is_active=True).order_by(Profile.name).all()
+    stats_by_profile = [(p, compute_dashboard_stats(p.id)) for p in profiles]
+
+    return render_template(
+        "admin/metrics_settings.html",
+        enabled=is_metrics_enabled(),
+        token=token,
+        scrape_url=scrape_url,
+        metric_defs=_PROM_METRICS,
+        stats_by_profile=stats_by_profile,
+    )
+
+
 def _abort(code):
     from flask import abort
     abort(code)

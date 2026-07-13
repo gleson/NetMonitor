@@ -38,7 +38,9 @@ dashboard em tempo real.
 - **Reconhecimento de alertas em massa** respeitando os filtros ativos da lista
   (tipo/severidade/dispositivo) — reconhece só o subconjunto visível.
 - **Métricas Prometheus** (opt-in) em `/api/metrics/prometheus`, por perfil,
-  reusando os mesmos contadores do dashboard; protegidas por token opcional.
+  reusando os mesmos contadores do dashboard. Habilitação, token e uma prévia
+  dos valores são gerenciados na interface em **Admin → Métricas Prometheus**
+  (sem reiniciar); token gerado no sistema e exigido no scrape.
 - **Backup automático** do SQLite (agendado) + comando CLI.
 - **Segurança**: CSP/HSTS via Talisman, CSRF, rate-limit no login, **bloqueio de
   conta** por excesso de tentativas, criptografia Fernet das communities SNMP.
@@ -188,8 +190,8 @@ pytest -x -q --tb=short         # fail-fast
 | `SCAN_RETENTION_DAYS` / `ALERT_RETENTION_DAYS` / `SNAPSHOT_RETENTION_DAYS` / `AUDIT_LOG_RETENTION_DAYS` | `30/90/180/365` | Retenção de dados (0 desativa a limpeza). |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_USE_TLS` | — | Envio de e-mail para alertas. |
 | `NOTIFICATIONS_ENABLED` | `1` | Liga/desliga notificações externas. |
-| `METRICS_ENABLED` | `0` | Expõe `/api/metrics/prometheus` (texto Prometheus, sem login). |
-| `METRICS_TOKEN` | — | Exige `Authorization: Bearer <token>` ou `?token=` no scrape (vazio = aberto). |
+| `METRICS_ENABLED` | `0` | Padrão de `/api/metrics/prometheus` quando não configurado na UI (Admin → Métricas sobrescreve). |
+| `METRICS_TOKEN` | — | Token padrão do scrape quando não definido na UI (`Authorization: Bearer` ou `?token=`; vazio = aberto). |
 
 Ajustes adicionais em `app/config.py` e, em runtime, no painel **Admin → Configurações de Scan**.
 
