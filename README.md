@@ -32,6 +32,13 @@ dashboard em tempo real.
 - **Verificação de certificados TLS** (expiração) e baseline de portas
   (`is_authorized`) para suprimir reincidência de alertas conhecidos.
 - **RBAC**: `viewer < operator < admin`, com **audit log** de ações sensíveis.
+- **Exportação/importação** de dispositivos, alertas, vulnerabilidades e histórico
+  de portas (CSV/JSON), com opção **cifrada por senha** (scrypt + Fernet, arquivo
+  `.enc` portátil entre instalações) e proteção contra CSV/Formula Injection.
+- **Reconhecimento de alertas em massa** respeitando os filtros ativos da lista
+  (tipo/severidade/dispositivo) — reconhece só o subconjunto visível.
+- **Métricas Prometheus** (opt-in) em `/api/metrics/prometheus`, por perfil,
+  reusando os mesmos contadores do dashboard; protegidas por token opcional.
 - **Backup automático** do SQLite (agendado) + comando CLI.
 - **Segurança**: CSP/HSTS via Talisman, CSRF, rate-limit no login, **bloqueio de
   conta** por excesso de tentativas, criptografia Fernet das communities SNMP.
@@ -181,6 +188,8 @@ pytest -x -q --tb=short         # fail-fast
 | `SCAN_RETENTION_DAYS` / `ALERT_RETENTION_DAYS` / `SNAPSHOT_RETENTION_DAYS` / `AUDIT_LOG_RETENTION_DAYS` | `30/90/180/365` | Retenção de dados (0 desativa a limpeza). |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_USE_TLS` | — | Envio de e-mail para alertas. |
 | `NOTIFICATIONS_ENABLED` | `1` | Liga/desliga notificações externas. |
+| `METRICS_ENABLED` | `0` | Expõe `/api/metrics/prometheus` (texto Prometheus, sem login). |
+| `METRICS_TOKEN` | — | Exige `Authorization: Bearer <token>` ou `?token=` no scrape (vazio = aberto). |
 
 Ajustes adicionais em `app/config.py` e, em runtime, no painel **Admin → Configurações de Scan**.
 

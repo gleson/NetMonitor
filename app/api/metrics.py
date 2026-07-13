@@ -21,16 +21,16 @@ def _local_offset_hours() -> int:
     return int(current_app.config.get("LOCAL_TIMEZONE_OFFSET", -3))
 
 
-def _local_datetime(col):
-    """Expressão SQL que adiciona o offset local a uma coluna UTC.
+def _to_local(dt):
+    """Converte um timestamp naive-UTC do banco para o fuso local configurado.
 
-    SQLite suporta `datetime(col, '+N hours')`. É o que usamos para
-    agrupar por dia/hora no fuso local (evita o bug 21–00h BRT caindo
-    no dia seguinte).
+    O bucketing por dia/hora local é feito em Python, não em SQL: funções como
+    strftime()/datetime(col, '+N hours') são exclusivas do SQLite e quebrariam
+    numa migração para Postgres. O volume envolvido (devices e snapshots de um
+    perfil dentro do período) é pequeno, então agregar aqui é barato — e evita
+    depender de o strftime do banco e o do Python gerarem chaves idênticas.
     """
-    offset = _local_offset_hours()
-    sign = "+" if offset >= 0 else "-"
-    return func.datetime(col, f"{sign}{abs(offset)} hours")
+    return dt + timedelta(hours=_local_offset_hours())
 
 
 @api_bp.route("/metrics/devices-timeline")
@@ -51,23 +51,21 @@ def devices_timeline():
     start = now - timedelta(days=days)
 
     # Agrupa devices por dia no fuso local (#6) — sem isso 21:00–23:59 BRT
-    # caem no dia seguinte UTC.
-    local_day = func.date(_local_datetime(Device.first_seen_at))
-
-    results = (
-        db.session.query(
-            local_day.label("date"),
-            func.count(Device.id).label("count"),
-        )
+    # caem no dia seguinte UTC. Bucketing em Python (ver _to_local).
+    rows = (
+        db.session.query(Device.first_seen_at)
         .filter(Device.profile_id == profile_id)
         .filter(Device.first_seen_at >= start)
-        .group_by(local_day)
-        .order_by(local_day)
         .all()
     )
 
     # Mapa dia -> novos devices
-    new_by_date = {str(row.date): row.count for row in results}
+    new_by_date: dict[str, int] = {}
+    for (first_seen,) in rows:
+        if first_seen is None:
+            continue
+        day = _to_local(first_seen).strftime("%Y-%m-%d")
+        new_by_date[day] = new_by_date.get(day, 0) + 1
 
     # Conta cumulativo total de devices antes do período
     total_before = Device.query.filter(
@@ -76,8 +74,7 @@ def devices_timeline():
     ).count()
 
     # Preenche TODOS os dias do período (contados no fuso local).
-    offset_h = _local_offset_hours()
-    local_start = start + timedelta(hours=offset_h)
+    local_start = _to_local(start)
     timeline = []
     cumulative = total_before
     for i in range(days + 1):
@@ -123,51 +120,53 @@ def online_timeline():
 
     if granularity == "hour":
         start = now - timedelta(hours=span)
-        fmt_sqlite = "%Y-%m-%d %H:00"
+        fmt = "%Y-%m-%d %H:00"
         slot_delta = timedelta(hours=1)
         total_slots = span
     else:
         start = now - timedelta(days=span)
-        fmt_sqlite = "%Y-%m-%d"
+        fmt = "%Y-%m-%d"
         slot_delta = timedelta(days=1)
         total_slots = span
 
     # Buckets em fuso local (#6) — snapshots/first_seen são UTC no DB.
-    snap_local = _local_datetime(DeviceOnlineSnapshot.recorded_at)
-    dev_local = _local_datetime(Device.first_seen_at)
-
-    online_rows = (
+    # Agregação (max/count) em Python para ficar portátil entre bancos
+    # (ver _to_local).
+    snap_rows = (
         db.session.query(
-            func.strftime(fmt_sqlite, snap_local).label("slot"),
-            func.max(DeviceOnlineSnapshot.online_count).label("count"),
+            DeviceOnlineSnapshot.recorded_at,
+            DeviceOnlineSnapshot.online_count,
         )
         .filter(
             DeviceOnlineSnapshot.profile_id == profile_id,
             DeviceOnlineSnapshot.recorded_at >= start,
         )
-        .group_by(func.strftime(fmt_sqlite, snap_local))
         .all()
     )
-    online_by_slot = {row.slot: row.count for row in online_rows}
+    online_by_slot: dict[str, int] = {}
+    for recorded_at, count in snap_rows:
+        key = _to_local(recorded_at).strftime(fmt)
+        if count > online_by_slot.get(key, -1):
+            online_by_slot[key] = count
 
-    new_rows = (
-        db.session.query(
-            func.strftime(fmt_sqlite, dev_local).label("slot"),
-            func.count(Device.id).label("count"),
-        )
+    dev_rows = (
+        db.session.query(Device.first_seen_at)
         .filter(Device.profile_id == profile_id, Device.first_seen_at >= start)
-        .group_by(func.strftime(fmt_sqlite, dev_local))
         .all()
     )
-    new_by_slot = {row.slot: row.count for row in new_rows}
+    new_by_slot: dict[str, int] = {}
+    for (first_seen,) in dev_rows:
+        if first_seen is None:
+            continue
+        key = _to_local(first_seen).strftime(fmt)
+        new_by_slot[key] = new_by_slot.get(key, 0) + 1
 
     # Slots preenchidos no fuso local para casar com as chaves dos buckets.
-    offset_h = _local_offset_hours()
-    local_start = start + timedelta(hours=offset_h)
+    local_start = _to_local(start)
     timeline = []
     for i in range(total_slots + 1):
         slot_dt = local_start + slot_delta * i
-        key = slot_dt.strftime(fmt_sqlite)
+        key = slot_dt.strftime(fmt)
         timeline.append({
             "slot": key,
             "online_devices": online_by_slot.get(key, 0),

@@ -10,6 +10,9 @@ from flask import Blueprint, request, Response, stream_with_context, redirect, u
 from flask_login import login_required, current_user
 
 from app.auth_utils import require_role, audit
+from app.crypto_export import (
+    encrypt_payload, decrypt_payload, is_encrypted_envelope, DecryptError,
+)
 from app.extensions import db
 from app.models import (
     Device, DeviceIp, Port, Alert, Vulnerability, Profile,
@@ -21,7 +24,9 @@ export_bp = Blueprint("export", __name__)
 
 _FMT = "%d/%m/%Y %H:%M:%S"
 _IMPORT_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-_VALID_SITUATIONS = {"NI", "Autorizado", "Identificado", "Suspeito", "Não Autorizado"}
+# Valores atuais do select: NI / Ok / Não Autorizado. Os demais são mantidos
+# para importar arquivos antigos sem perder a situação já gravada.
+_VALID_SITUATIONS = {"NI", "Ok", "Não Autorizado", "Autorizado", "Identificado", "Suspeito"}
 
 
 def _fmt_dt(dt):
@@ -30,6 +35,39 @@ def _fmt_dt(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.strftime(_FMT)
+
+
+def _csv_safe(value):
+    """Neutraliza CSV/Formula Injection (CWE-1236).
+
+    Campos como hostname/vendor/os_guess e o output de scripts NSE do nmap vêm
+    da rede (não-confiáveis). Prefixa com aspa simples as células que começam
+    com um caractere que o Excel/LibreOffice interpretaria como fórmula.
+    """
+    s = "" if value is None else str(value)
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
+def _safe_row(values):
+    """Aplica _csv_safe a cada célula de uma linha de CSV."""
+    return [_csv_safe(v) for v in values]
+
+
+def _export_password() -> str:
+    """Senha de criptografia da exportação (form ou query). Vazia = sem cifra."""
+    return (request.values.get("password") or "").strip()
+
+
+def _encrypted_response(payload_text: str, fmt: str, password: str, base_filename: str) -> Response:
+    """Cifra `payload_text` com `password` e devolve como anexo .enc."""
+    envelope = encrypt_payload(payload_text, password, fmt=fmt)
+    return Response(
+        envelope,
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base_filename}.{fmt}.enc"'
+        },
+    )
 
 
 def _parse_dt(value: str):
@@ -114,8 +152,8 @@ def _set_device_ip(device: Device, ip: str) -> None:
     db.session.add(dip)
 
 
-def _parse_import_json(fileobj) -> list[dict]:
-    data = json.load(io.TextIOWrapper(fileobj, encoding="utf-8"))
+def _parse_import_json(text: str) -> list[dict]:
+    data = json.loads(text)
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -123,9 +161,8 @@ def _parse_import_json(fileobj) -> list[dict]:
     return []
 
 
-def _parse_import_csv(fileobj) -> list[dict]:
-    text = io.TextIOWrapper(fileobj, encoding="utf-8-sig")
-    reader = csv.DictReader(text)
+def _parse_import_csv(text: str) -> list[dict]:
+    reader = csv.DictReader(io.StringIO(text))
     return list(reader)
 
 
@@ -162,15 +199,38 @@ def import_devices():
         flash(f"Arquivo muito grande (máx. 5 MB). Tamanho: {size // 1024} KB.", "danger")
         return redirect(url_for("devices.device_list", profile_id=profile_id))
 
-    fname = file.filename.lower()
     try:
-        if fname.endswith(".json"):
-            rows = _parse_import_json(file)
-        elif fname.endswith(".csv"):
-            rows = _parse_import_csv(file)
-        else:
-            flash("Formato não suportado. Use .json ou .csv gerado pela exportação.", "danger")
+        raw_text = file.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        flash("Não foi possível ler o arquivo (codificação inválida).", "danger")
+        return redirect(url_for("devices.device_list", profile_id=profile_id))
+
+    fname = file.filename.lower()
+
+    # Arquivo cifrado (.enc): decifra com a senha antes de detectar o formato.
+    if is_encrypted_envelope(raw_text):
+        password = (request.form.get("password") or "").strip()
+        if not password:
+            flash("Arquivo cifrado: informe a senha usada na exportação.", "danger")
             return redirect(url_for("devices.device_list", profile_id=profile_id))
+        try:
+            raw_text, fmt = decrypt_payload(raw_text, password)
+        except DecryptError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("devices.device_list", profile_id=profile_id))
+    elif fname.endswith(".json"):
+        fmt = "json"
+    elif fname.endswith(".csv"):
+        fmt = "csv"
+    else:
+        flash("Formato não suportado. Use .json ou .csv gerado pela exportação.", "danger")
+        return redirect(url_for("devices.device_list", profile_id=profile_id))
+
+    try:
+        if fmt == "json":
+            rows = _parse_import_json(raw_text)
+        else:
+            rows = _parse_import_csv(raw_text)
     except Exception as exc:
         flash(f"Erro ao ler arquivo: {exc}", "danger")
         return redirect(url_for("devices.device_list", profile_id=profile_id))
@@ -247,16 +307,18 @@ def import_devices():
 # Exportação — Devices
 # ---------------------------------------------------------------------------
 
-@export_bp.route("/devices/export")
+@export_bp.route("/devices/export", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_OPERATOR)
 def export_devices():
     """Exporta inventário de dispositivos em CSV ou JSON.
 
-    Query params: profile_id (obrigatório), format=csv|json (default csv).
+    Params: profile_id (obrigatório), format=csv|json (default csv).
+    Para exportação cifrada, use POST com `password` (deriva a chave por scrypt).
     """
-    profile_id = request.args.get("profile_id", type=int)
-    fmt = request.args.get("format", "csv").lower()
+    profile_id = request.values.get("profile_id", type=int)
+    fmt = request.values.get("format", "csv").lower()
+    password = _export_password()
 
     if not profile_id:
         return Response("profile_id é obrigatório.", status=400)
@@ -301,6 +363,8 @@ def export_devices():
             ensure_ascii=False,
             indent=2,
         )
+        if password:
+            return _encrypted_response(payload, "json", password, f"devices_{profile_id}")
         return Response(
             payload,
             mimetype="application/json",
@@ -308,7 +372,7 @@ def export_devices():
         )
 
     # CSV
-    def _generate():
+    def _devices_csv_rows():
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow([
@@ -323,7 +387,7 @@ def export_devices():
             ).count()
             buf = io.StringIO()
             writer = csv.writer(buf)
-            writer.writerow([
+            writer.writerow(_safe_row([
                 d.mac, d.friendly_name or "", d.hostname or "",
                 d.vendor or "",
                 d.device_type.value if d.device_type else "",
@@ -331,11 +395,14 @@ def export_devices():
                 d.situation or "", d.tags or "", d.notes or "",
                 port_count,
                 _fmt_dt(d.first_seen_at), _fmt_dt(d.last_seen_at),
-            ])
+            ]))
             yield buf.getvalue()
 
+    if password:
+        return _encrypted_response("".join(_devices_csv_rows()), "csv", password, f"devices_{profile_id}")
+
     return Response(
-        stream_with_context(_generate()),
+        stream_with_context(_devices_csv_rows()),
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="devices_{profile_id}.csv"'},
     )
@@ -345,17 +412,19 @@ def export_devices():
 # Exportação — Alertas
 # ---------------------------------------------------------------------------
 
-@export_bp.route("/alerts/export")
+@export_bp.route("/alerts/export", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_OPERATOR)
 def export_alerts():
     """Exporta alertas em CSV ou JSON.
 
-    Query params: profile_id (obrigatório), format=csv|json, status=open|acknowledged.
+    Params: profile_id (obrigatório), format=csv|json, status=open|acknowledged.
+    Para exportação cifrada, use POST com `password`.
     """
-    profile_id = request.args.get("profile_id", type=int)
-    fmt = request.args.get("format", "csv").lower()
-    status = request.args.get("status", "")
+    profile_id = request.values.get("profile_id", type=int)
+    fmt = request.values.get("format", "csv").lower()
+    status = request.values.get("status", "")
+    password = _export_password()
 
     if not profile_id:
         return Response("profile_id é obrigatório.", status=400)
@@ -384,13 +453,15 @@ def export_alerts():
                 "acknowledged_at": _fmt_dt(a.acknowledged_at),
             })
         payload = json.dumps({"profile": profile.name, "alerts": rows}, ensure_ascii=False, indent=2)
+        if password:
+            return _encrypted_response(payload, "json", password, f"alerts_{profile_id}")
         return Response(
             payload,
             mimetype="application/json",
             headers={"Content-Disposition": f'attachment; filename="alerts_{profile_id}.json"'},
         )
 
-    def _generate():
+    def _alerts_csv_rows():
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["ID", "Tipo", "Severidade", "Mensagem", "Device ID", "Criado em", "Reconhecido em"])
@@ -398,15 +469,18 @@ def export_alerts():
         for a in alerts:
             buf = io.StringIO()
             writer = csv.writer(buf)
-            writer.writerow([
+            writer.writerow(_safe_row([
                 a.id, a.alert_type.value, a.severity.value, a.message,
                 a.device_id or "",
                 _fmt_dt(a.created_at), _fmt_dt(a.acknowledged_at),
-            ])
+            ]))
             yield buf.getvalue()
 
+    if password:
+        return _encrypted_response("".join(_alerts_csv_rows()), "csv", password, f"alerts_{profile_id}")
+
     return Response(
-        stream_with_context(_generate()),
+        stream_with_context(_alerts_csv_rows()),
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="alerts_{profile_id}.csv"'},
     )
@@ -416,19 +490,20 @@ def export_alerts():
 # Exportação — Vulnerabilidades
 # ---------------------------------------------------------------------------
 
-@export_bp.route("/devices/<int:device_id>/vulns/export")
+@export_bp.route("/devices/<int:device_id>/vulns/export", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_OPERATOR)
 def export_vulns(device_id):
     """Exporta vulnerabilidades de um device em CSV ou JSON.
 
-    Query params: format=csv|json.
+    Params: format=csv|json. Para exportação cifrada, use POST com `password`.
     """
     device = db.session.get(Device, device_id)
     if not device:
         return Response("Dispositivo não encontrado.", status=404)
 
-    fmt = request.args.get("format", "csv").lower()
+    fmt = request.values.get("format", "csv").lower()
+    password = _export_password()
     vulns = Vulnerability.query.filter_by(device_id=device_id).order_by(
         Vulnerability.is_vulnerable.desc(), Vulnerability.last_seen_at.desc()
     ).all()
@@ -451,13 +526,15 @@ def export_vulns(device_id):
         payload = json.dumps({
             "device": device.display_name, "mac": device.mac, "vulnerabilities": rows
         }, ensure_ascii=False, indent=2)
+        if password:
+            return _encrypted_response(payload, "json", password, f"vulns_{device_id}")
         return Response(
             payload,
             mimetype="application/json",
             headers={"Content-Disposition": f'attachment; filename="vulns_{device_id}.json"'},
         )
 
-    def _generate():
+    def _vulns_csv_rows():
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["ID", "Porta", "Protocolo", "Serviço", "Script", "Vulnerável", "Output", "Encontrado em", "Resolvido em"])
@@ -465,15 +542,103 @@ def export_vulns(device_id):
         for v in vulns:
             buf = io.StringIO()
             writer = csv.writer(buf)
-            writer.writerow([
+            writer.writerow(_safe_row([
                 v.id, v.port, v.protocol, v.service, v.script_name,
                 "Sim" if v.is_vulnerable else "Não",
                 v.output, _fmt_dt(v.found_at), _fmt_dt(v.resolved_at),
-            ])
+            ]))
             yield buf.getvalue()
 
+    if password:
+        return _encrypted_response("".join(_vulns_csv_rows()), "csv", password, f"vulns_{device_id}")
+
     return Response(
-        stream_with_context(_generate()),
+        stream_with_context(_vulns_csv_rows()),
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="vulns_{device_id}.csv"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exportação — Histórico de portas
+# ---------------------------------------------------------------------------
+
+@export_bp.route("/devices/<int:device_id>/ports/export", methods=["GET", "POST"])
+@login_required
+@require_role(ROLE_OPERATOR)
+def export_port_history(device_id):
+    """Exporta o histórico de portas de um device em CSV ou JSON.
+
+    Inclui portas abertas e já fechadas, com os timestamps de abertura/fecho e o
+    baseline (is_authorized). Params: format=csv|json. Para exportação cifrada,
+    use POST com `password`.
+    """
+    device = db.session.get(Device, device_id)
+    if not device:
+        return Response("Dispositivo não encontrado.", status=404)
+
+    fmt = request.values.get("format", "csv").lower()
+    password = _export_password()
+    ports = (
+        Port.query.filter_by(device_id=device_id)
+        .order_by(Port.protocol, Port.port)
+        .all()
+    )
+
+    if fmt == "json":
+        rows = [
+            {
+                "protocol": p.protocol,
+                "port": p.port,
+                "state": p.state,
+                "is_open": p.last_seen_closed_at is None,
+                "is_authorized": p.is_authorized,
+                "service_name": p.service_name,
+                "service_version": p.service_version,
+                "first_open_at": _fmt_dt(p.first_open_at),
+                "last_seen_open_at": _fmt_dt(p.last_seen_open_at),
+                "last_seen_closed_at": _fmt_dt(p.last_seen_closed_at),
+            }
+            for p in ports
+        ]
+        payload = json.dumps({
+            "device": device.display_name, "mac": device.mac, "ports": rows
+        }, ensure_ascii=False, indent=2)
+        if password:
+            return _encrypted_response(payload, "json", password, f"ports_{device_id}")
+        return Response(
+            payload,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="ports_{device_id}.json"'},
+        )
+
+    def _ports_csv_rows():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "Protocolo", "Porta", "Estado", "Aberta agora", "Autorizada",
+            "Serviço", "Versão", "Primeira abertura", "Visto aberto por último",
+            "Fechada em",
+        ])
+        yield buf.getvalue()
+        for p in ports:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(_safe_row([
+                p.protocol, p.port, p.state,
+                "Sim" if p.last_seen_closed_at is None else "Não",
+                "Sim" if p.is_authorized else "Não",
+                p.service_name or "", p.service_version or "",
+                _fmt_dt(p.first_open_at), _fmt_dt(p.last_seen_open_at),
+                _fmt_dt(p.last_seen_closed_at),
+            ]))
+            yield buf.getvalue()
+
+    if password:
+        return _encrypted_response("".join(_ports_csv_rows()), "csv", password, f"ports_{device_id}")
+
+    return Response(
+        stream_with_context(_ports_csv_rows()),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="ports_{device_id}.csv"'},
     )

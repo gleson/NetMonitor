@@ -6,6 +6,7 @@ Cada job usa app_context para acessar o banco de dados.
 
 import ipaddress
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -44,7 +45,18 @@ _quick_host_down_lock = threading.Lock()
 # Protegido por _port_scan_retry_lock (mutado a partir de threads do
 # ThreadPoolExecutor em run_port_scan e da thread de scan on-demand).
 _port_scan_retry_args: dict[int, int] = {}
+# device_id -> nº de detecções consecutivas de "bug de portas sumidas".
+# Depois de esgotar a sequência de scans alternativos sem reencontrar as
+# portas, desistimos e aceitamos o fechamento — do contrário um host que
+# fechou legitimamente todas as portas (ex.: firewall ligado) seria
+# reescaneado para sempre a cada ciclo. Protegido por _port_scan_retry_lock.
+_port_scan_bug_attempts: dict[int, int] = {}
 _port_scan_retry_lock = threading.Lock()
+
+# Máximo de rodadas com scan alternativo antes de aceitar que as portas
+# fecharam de fato. Igual ao tamanho da sequência de _next_alternate_nmap_args
+# (uma tentativa por variante de scan).
+_PORT_SCAN_MAX_BUG_RETRIES = 3
 
 
 def _utcnow():
@@ -565,11 +577,16 @@ def run_host_discovery(profile_id: int):
                     )
                     conflict_type = AlertType.ARP_SPOOFING if spoof_suspect else AlertType.IP_CONFLICT
 
+                    # Dedupe pelo IP na mensagem. O espaço à direita é obrigatório:
+                    # sem ele "192.168.1.1" casaria como substring de
+                    # "192.168.1.10"/"192.168.1.100" e suprimiria um conflito real
+                    # em outro IP. Ambas as mensagens (spoofing e conflito) trazem
+                    # "{host.ip} " logo no início, então o delimitador é seguro.
                     already_open = Alert.query.filter_by(
                         profile_id=profile.id,
                         alert_type=conflict_type,
                     ).filter(
-                        Alert.message.contains(host.ip),
+                        Alert.message.contains(f"{host.ip} "),
                         Alert.acknowledged_at.is_(None),
                     ).first()
                     if not already_open:
@@ -1016,23 +1033,36 @@ def run_port_scan(profile_id: int):
         return
 
     try:
-        # Reconstrução + extração do lote sob lock único, evitando race com
-        # prepend_to_port_scan_queue executando em outra thread.
+        # Decide se precisa reconstruir a fila SEM segurar o lock durante a
+        # consulta ao banco. _build_scan_tasks_for_profile faz várias queries;
+        # rodá-las sob _port_scan_queues_lock bloquearia prepend_to_port_scan_queue
+        # (thread de discovery) por toda a I/O. Construímos fora do lock e
+        # reconciliamos numa seção crítica curta logo abaixo.
+        with _port_scan_queues_lock:
+            needs_build = not _port_scan_queues.get(profile_id)
+
+        built_tasks: list[dict] | None = None
+        if needs_build:
+            built_tasks = _build_scan_tasks_for_profile(profile_id)
+
         with _port_scan_queues_lock:
             queue = _port_scan_queues.get(profile_id)
             if not queue:
-                # Fora do lock? Não — _build_scan_tasks_for_profile consulta o
-                # DB mas o session do SQLAlchemy é thread-local e as filas in-memory
-                # são pequenas; manter simples e thread-safe.
-                tasks = _build_scan_tasks_for_profile(profile_id)
-                if not tasks:
-                    return
-                queue = deque(tasks)
+                if not built_tasks:
+                    return  # nada elegível e nenhum prepend concorrente
+                queue = deque(built_tasks)
                 _port_scan_queues[profile_id] = queue
                 logger.info(
                     "Fila de port scan para '%s' reconstruída: %d devices.",
-                    profile.name, len(tasks),
+                    profile.name, len(built_tasks),
                 )
+            elif built_tasks:
+                # Um prepend concorrente criou/alterou a fila enquanto
+                # construíamos. Preserva o que já está enfileirado (devices novos
+                # têm prioridade) e acrescenta os elegíveis ainda ausentes, sem
+                # duplicar por device_id.
+                present = {t["device_id"] for t in queue}
+                queue.extend(t for t in built_tasks if t["device_id"] not in present)
 
             batch: list[dict] = []
             while queue and len(batch) < profile.max_concurrent_scans:
@@ -1158,16 +1188,42 @@ def run_port_scan(profile_id: int):
                     host_found and len(old_set) >= 2 and len(found_set) == 0
                 )
 
+                # Depois de esgotar a sequência de scans alternativos sem
+                # reencontrar as portas, desistimos: provavelmente elas fecharam
+                # de fato (firewall/reconfiguração). Sem esse limite, um host
+                # nessa condição seria re-enfileirado a cada ciclo para sempre,
+                # nunca marcando as portas como fechadas.
+                gave_up_on_bug = False
                 if ports_vanished_bug:
+                    with _port_scan_retry_lock:
+                        attempts = _port_scan_bug_attempts.get(device_id, 0) + 1
+                        _port_scan_bug_attempts[device_id] = attempts
+                    gave_up_on_bug = attempts > _PORT_SCAN_MAX_BUG_RETRIES
+
+                if ports_vanished_bug and not gave_up_on_bug:
                     logger.warning(
                         "Port scan %s (%s): %d portas anteriores e 0 encontradas — "
-                        "tratando como bug. Re-enfileirando com scan alternativo.",
+                        "tratando como bug (tentativa %d/%d). Re-enfileirando com "
+                        "scan alternativo.",
                         device_display, ip_str, len(old_set),
+                        attempts, _PORT_SCAN_MAX_BUG_RETRIES,
                     )
                     _requeue_with_alternate_scan(
                         profile.id, device_id, device_display, ip_str, task["ports"]
                     )
                 elif host_found:
+                    if gave_up_on_bug:
+                        logger.warning(
+                            "Port scan %s (%s): %d portas seguem sumidas após %d "
+                            "rodadas de scan alternativo — aceitando fechamento.",
+                            device_display, ip_str, len(old_set),
+                            _PORT_SCAN_MAX_BUG_RETRIES,
+                        )
+                    # Sucesso normal ou desistência: zera o estado de retry do
+                    # device para que uma futura sumida transitória recomece limpa.
+                    with _port_scan_retry_lock:
+                        _port_scan_bug_attempts.pop(device_id, None)
+                        _port_scan_retry_args.pop(device_id, None)
                     # Cenário normal: marca portas que desapareceram como fechadas.
                     for key in (old_set - found_set):
                         proto, port_num = key
@@ -1215,8 +1271,9 @@ def run_port_scan(profile_id: int):
                             p.service_name = pi.service_name
 
                 # Marca timestamp do port scan no device (guarda cooldown de 24h).
-                # Pula no caso ports_vanished_bug — queremos re-escanear logo.
-                if host_found and not ports_vanished_bug:
+                # Pula enquanto tratamos como bug (queremos re-escanear logo), mas
+                # aplica quando desistimos — aí o resultado já é definitivo.
+                if host_found and (not ports_vanished_bug or gave_up_on_bug):
                     _device = db.session.get(Device, device_id)
                     if _device:
                         _device.last_port_scanned_at = now
@@ -1226,6 +1283,12 @@ def run_port_scan(profile_id: int):
                 filtered_ports = [p for p in found_ports if "filtered" in p.state]
                 if not host_found:
                     scan_summary = "Host não respondeu ao scan"
+                elif ports_vanished_bug and gave_up_on_bug:
+                    scan_summary = (
+                        f"{len(old_set)} portas seguem sumidas após "
+                        f"{_PORT_SCAN_MAX_BUG_RETRIES} scans alternativos — "
+                        "fechamento aceito."
+                    )
                 elif ports_vanished_bug:
                     scan_summary = (
                         f"Bug detectado: {len(old_set)} portas anteriores e 0 encontradas — "
@@ -1967,8 +2030,15 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
                 )
                 existing.last_seen_at = now
                 existing.output = v["output"]
+                if is_vulnerable:
+                    # Voltou (ou segue) vulnerável — reabre.
+                    existing.resolved_at = None
+                elif existing.is_vulnerable:
+                    # Transição vulnerável → não detectada: marca como resolvida
+                    # (antes o resolved_at era zerado incondicionalmente e a
+                    # vulnerabilidade nunca aparecia como resolvida).
+                    existing.resolved_at = now
                 existing.is_vulnerable = is_vulnerable
-                existing.resolved_at = None
             else:
                 newly_vulnerable = is_vulnerable
                 db.session.add(Vulnerability(
@@ -2152,6 +2222,35 @@ def _detect_os(ip: str) -> dict:
     return result
 
 
+# Linhas "State: VULNERABLE"/"State: NOT VULNERABLE" da biblioteca vulns do NSE.
+_VULN_STATE_RE = re.compile(r"STATE\s*:\s*([A-Z][A-Z ()/-]*)")
+
+
+def _output_indicates_vulnerable(output: str) -> bool:
+    """Interpreta a saída de um script NSE de vulnerabilidade.
+
+    A heurística ingênua (``"VULNERABLE" in output.upper()``) dava falso
+    positivo em "NOT VULNERABLE" (substring) e em menções casuais à palavra
+    no texto do script. Scripts que usam a biblioteca ``vulns`` do NSE
+    imprimem um campo explícito ``State: VULNERABLE`` / ``NOT VULNERABLE`` /
+    ``LIKELY VULNERABLE`` — quando presente, ele decide. Sem o campo, cai
+    num matching por palavra que exclui a negação.
+    """
+    up = (output or "").upper()
+
+    states = _VULN_STATE_RE.findall(up)
+    if states:
+        # Um output pode agregar vários checks (um State por CVE) — basta um
+        # positivo. "NOT VULNERABLE"/"UNKNOWN"/"ERROR" não contam.
+        return any(
+            "VULNERABLE" in s and not s.strip().startswith("NOT") for s in states
+        )
+
+    # Fallback (scripts sem a biblioteca vulns): palavra VULNERABLE não
+    # precedida de NOT. Cobre "LIKELY VULNERABLE" e texto livre.
+    return re.search(r"(?<!NOT )\bVULNERABLE\b", up) is not None
+
+
 def _scan_vulnerabilities(ip: str) -> dict:
     """Scan básico de vulnerabilidades via nmap scripts."""
     import nmap
@@ -2175,7 +2274,7 @@ def _scan_vulnerabilities(ip: str) -> dict:
                             "service": service,
                             "script": script_name,
                             "output": output[:1000],
-                            "is_vulnerable": "VULNERABLE" in output.upper(),
+                            "is_vulnerable": _output_indicates_vulnerable(output),
                         })
 
             # Scripts a nível de host (não associados a porta)
@@ -2187,7 +2286,7 @@ def _scan_vulnerabilities(ip: str) -> dict:
                     "service": "host",
                     "script": script.get("id", ""),
                     "output": script.get("output", "")[:1000],
-                    "is_vulnerable": "VULNERABLE" in script.get("output", "").upper(),
+                    "is_vulnerable": _output_indicates_vulnerable(script.get("output", "")),
                 })
 
     except Exception as e:
@@ -2541,6 +2640,9 @@ def _prune_stale_scan_state() -> None:
     with _port_scan_retry_lock:
         for did in [d for d in _port_scan_retry_args if d not in device_ids]:
             del _port_scan_retry_args[did]
+            removed += 1
+        for did in [d for d in _port_scan_bug_attempts if d not in device_ids]:
+            del _port_scan_bug_attempts[did]
             removed += 1
     with _port_scan_queues_lock:
         for pid in [p for p in _port_scan_queues if p not in active_profile_ids]:

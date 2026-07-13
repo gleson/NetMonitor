@@ -140,3 +140,120 @@ class TestPruneStaleScanState:
             with scheduling._port_scan_queues_lock:
                 scheduling._port_scan_queues.pop(sample_profile.id, None)
                 scheduling._port_scan_queues.pop(orphan_id, None)
+
+
+class TestPortsVanishedGiveUp:
+    """Item #2: após esgotar a sequência de scans alternativos sem reencontrar
+    as portas, o scanner desiste e aceita o fechamento — em vez de re-enfileirar
+    o device a cada ciclo indefinidamente.
+    """
+
+    def test_gives_up_after_retry_sequence(self, db, sample_profile, sample_range, monkeypatch):
+        from app.models import Device, DeviceIp, Port, _utcnow
+        from app.scanner import scheduling
+        import app.scanner.ports as ports_mod
+        import app.scanner.hosts as hosts_mod
+
+        now = _utcnow()
+        device = Device(
+            profile_id=sample_profile.id, mac="AA:BB:CC:DD:EE:88", last_seen_at=now,
+        )
+        db.session.add(device)
+        db.session.flush()
+        db.session.add(DeviceIp(
+            device_id=device.id, ip="192.168.1.50", is_current=True,
+            first_seen_at=now, last_seen_at=now,
+        ))
+        # Duas portas abertas: >= 2 é o gatilho da heurística de "portas sumidas".
+        for pnum in (80, 443):
+            db.session.add(Port(
+                device_id=device.id, protocol="tcp", port=pnum, state="open",
+                first_open_at=now, last_seen_open_at=now,
+            ))
+        db.session.commit()
+        did = device.id
+
+        # Host sempre alcançável; o scan sempre volta com 0 portas (host_found=True).
+        monkeypatch.setattr(hosts_mod, "is_host_reachable", lambda ip, *a, **k: (True, "icmp"))
+        monkeypatch.setattr(ports_mod, "scan_ports_for_host", lambda *a, **k: ([], True))
+
+        def _open_count():
+            return Port.query.filter_by(device_id=did).filter(
+                Port.last_seen_closed_at.is_(None)
+            ).count()
+
+        try:
+            # Dentro da janela de retry as portas continuam abertas (só re-enfileira).
+            for _ in range(scheduling._PORT_SCAN_MAX_BUG_RETRIES):
+                scheduling.run_port_scan(sample_profile.id)
+                assert _open_count() == 2
+
+            # A rodada seguinte excede o limite → desiste e fecha as portas.
+            scheduling.run_port_scan(sample_profile.id)
+            assert _open_count() == 0
+            # O estado de retry do device é limpo ao aceitar o fechamento.
+            assert did not in scheduling._port_scan_bug_attempts
+            assert did not in scheduling._port_scan_retry_args
+        finally:
+            with scheduling._port_scan_queues_lock:
+                scheduling._port_scan_queues.pop(sample_profile.id, None)
+            with scheduling._port_scan_retry_lock:
+                scheduling._port_scan_bug_attempts.pop(did, None)
+                scheduling._port_scan_retry_args.pop(did, None)
+
+
+class TestOutputIndicatesVulnerable:
+    """Interpretação da saída de scripts NSE de vulnerabilidade (#9)."""
+
+    def _f(self, output):
+        from app.scanner.scheduling import _output_indicates_vulnerable
+        return _output_indicates_vulnerable(output)
+
+    def test_state_vulnerable(self):
+        out = (
+            "\n  VULNERABLE:\n"
+            "  Remote Code Execution vulnerability in Microsoft SMBv1 (ms17-010)\n"
+            "    State: VULNERABLE\n"
+            "    IDs:  CVE:CVE-2017-0143\n"
+        )
+        assert self._f(out) is True
+
+    def test_state_not_vulnerable(self):
+        # Bug antigo: 'VULNERABLE' é substring de 'NOT VULNERABLE' → falso positivo.
+        out = "\n  ms-sql-info:\n    State: NOT VULNERABLE\n"
+        assert self._f(out) is False
+
+    def test_state_likely_vulnerable(self):
+        out = "\n    State: LIKELY VULNERABLE\n    IDs:  CVE:CVE-2015-1635\n"
+        assert self._f(out) is True
+
+    def test_multiple_states_one_positive(self):
+        out = (
+            "  CVE-2014-0160:\n    State: NOT VULNERABLE\n"
+            "  CVE-2014-0224:\n    State: VULNERABLE\n"
+        )
+        assert self._f(out) is True
+
+    def test_multiple_states_all_negative(self):
+        out = (
+            "  CVE-2014-0160:\n    State: NOT VULNERABLE\n"
+            "  CVE-2014-0224:\n    State: NOT VULNERABLE\n"
+        )
+        assert self._f(out) is False
+
+    def test_plain_not_vulnerable_without_state_field(self):
+        assert self._f("Host is NOT VULNERABLE to this issue.") is False
+
+    def test_free_text_vulnerable(self):
+        assert self._f("The target appears VULNERABLE to CVE-2021-1234") is True
+
+    def test_unrelated_output(self):
+        assert self._f("http-server-header: Apache/2.4.41 (Ubuntu)") is False
+
+    def test_error_and_unknown_states(self):
+        assert self._f("    State: UNKNOWN (unable to test)\n") is False
+        assert self._f("ERROR: Script execution failed") is False
+
+    def test_empty_output(self):
+        assert self._f("") is False
+        assert self._f(None) is False

@@ -93,6 +93,94 @@ def test_import_devices_audit_log_does_not_crash(app, db, sample_profile):
 
 
 # ---------------------------------------------------------------------------
+# Exportação cifrada por senha (crypto_export) + round-trip de importação
+# ---------------------------------------------------------------------------
+
+def test_crypto_export_roundtrip_unit():
+    """encrypt/decrypt: senha correta decifra, senha errada falha."""
+    from app.crypto_export import (
+        encrypt_payload, decrypt_payload, is_encrypted_envelope, DecryptError,
+    )
+
+    env = encrypt_payload("mac,ip\n00:11,1.2.3.4\n", "segredo123", fmt="csv")
+    assert is_encrypted_envelope(env)
+    assert not is_encrypted_envelope('{"devices": []}')
+    assert not is_encrypted_envelope("mac,ip\n")
+
+    plaintext, fmt = decrypt_payload(env, "segredo123")
+    assert fmt == "csv" and plaintext.startswith("mac,ip")
+
+    with pytest.raises(DecryptError):
+        decrypt_payload(env, "errada")
+
+
+def test_export_encrypted_then_import(app, db, sample_profile):
+    """Exporta cifrado e reimporta o .enc com a senha — dados preservados."""
+    from app.crypto_export import is_encrypted_envelope
+
+    client = _login_as(app, db, "operator")
+    db.session.add(Device(
+        profile_id=sample_profile.id, mac="AA:BB:CC:DD:EE:01", friendly_name="Roteador",
+    ))
+    db.session.commit()
+
+    # Exportação cifrada (POST com senha)
+    resp = client.post("/export/devices/export", data={
+        "profile_id": str(sample_profile.id),
+        "format": "json",
+        "password": "segredo123",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["Content-Disposition"].endswith('.json.enc"')
+    enc = resp.data
+    assert is_encrypted_envelope(enc.decode("utf-8"))
+    assert b"Roteador" not in enc  # conteúdo não vaza em claro
+
+    # Reimporta o arquivo cifrado com a senha correta
+    resp = client.post("/export/devices/import", data={
+        "profile_id": str(sample_profile.id),
+        "file": (io.BytesIO(enc), "devices_1.json.enc"),
+        "password": "segredo123",
+    }, content_type="multipart/form-data")
+    assert resp.status_code == 302
+    d = Device.query.filter_by(mac="AA:BB:CC:DD:EE:01").first()
+    assert d is not None and d.friendly_name == "Roteador"
+
+
+def test_import_encrypted_wrong_password(app, db, sample_profile):
+    """Importar .enc com senha errada não cria devices e avisa o usuário."""
+    from app.crypto_export import encrypt_payload
+
+    client = _login_as(app, db, "operator")
+    enc = encrypt_payload(json.dumps({"devices": [{"mac": "AA:BB:CC:DD:EE:02"}]}),
+                          "certa123", fmt="json").encode("utf-8")
+
+    resp = client.post("/export/devices/import", data={
+        "profile_id": str(sample_profile.id),
+        "file": (io.BytesIO(enc), "devices.json.enc"),
+        "password": "errada",
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert resp.status_code == 200
+    assert Device.query.filter_by(mac="AA:BB:CC:DD:EE:02").first() is None
+
+
+def test_import_encrypted_missing_password(app, db, sample_profile):
+    """Importar .enc sem senha é rejeitado."""
+    from app.crypto_export import encrypt_payload
+
+    client = _login_as(app, db, "operator")
+    enc = encrypt_payload(json.dumps({"devices": [{"mac": "AA:BB:CC:DD:EE:03"}]}),
+                          "certa123", fmt="json").encode("utf-8")
+
+    resp = client.post("/export/devices/import", data={
+        "profile_id": str(sample_profile.id),
+        "file": (io.BytesIO(enc), "devices.json.enc"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert resp.status_code == 200
+    assert Device.query.filter_by(mac="AA:BB:CC:DD:EE:03").first() is None
+
+
+# ---------------------------------------------------------------------------
 # Baseline de portas (is_authorized) + rota de toggle
 # ---------------------------------------------------------------------------
 
@@ -106,6 +194,135 @@ def _make_device_with_port(db, profile, mac="AA:BB:CC:11:22:33", port=22,
     db.session.add(port_row)
     db.session.commit()
     return device, port_row
+
+
+def test_device_list_renders_batched_ip_and_ports(app, db, sample_profile):
+    """A lista de devices mostra IP atual e contagem de portas via dados
+    batelados na view (sem N+1 por device.current_ip / *_ports_count)."""
+    device, _port = _make_device_with_port(
+        db, sample_profile, mac="AA:BB:CC:44:55:66", port=443,
+        state="open", ip="192.168.1.77",
+    )
+    # Segunda porta filtrada: total=2, abertas=1.
+    db.session.add(Port(device_id=device.id, protocol="tcp", port=8080, state="filtered"))
+    db.session.commit()
+
+    client = _login_as(app, db, "viewer")
+    resp = client.get(f"/devices/?profile_id={sample_profile.id}")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "192.168.1.77" in body          # IP atual batelado
+    assert '2 porta(s) no total' in body   # total=2 (open + filtered)
+
+
+def test_export_port_history_json_and_encrypted(app, db, sample_profile):
+    """Exporta o histórico de portas em JSON puro e cifrado (.enc)."""
+    from app.crypto_export import is_encrypted_envelope
+
+    device, _port = _make_device_with_port(
+        db, sample_profile, mac="AA:BB:CC:9A:9B:9C", port=22, state="open",
+    )
+    client = _login_as(app, db, "operator")
+
+    # JSON puro
+    resp = client.get(f"/export/devices/{device.id}/ports/export?format=json")
+    assert resp.status_code == 200
+    data = json.loads(resp.get_data(as_text=True))
+    assert data["mac"] == "AA:BB:CC:9A:9B:9C"
+    assert any(p["port"] == 22 and p["is_open"] for p in data["ports"])
+
+    # Cifrado (POST com senha) — não vaza conteúdo em claro
+    resp = client.post(f"/export/devices/{device.id}/ports/export", data={
+        "format": "json", "password": "segredo123",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["Content-Disposition"].endswith('.json.enc"')
+    assert is_encrypted_envelope(resp.get_data(as_text=True))
+
+
+def test_export_port_history_requires_operator(app, db, sample_profile):
+    device, _port = _make_device_with_port(db, sample_profile, mac="AA:BB:CC:9A:9B:9D")
+    viewer = _login_as(app, db, "viewer")
+    resp = viewer.get(f"/export/devices/{device.id}/ports/export?format=json")
+    assert resp.status_code == 403
+
+
+def test_acknowledge_all_respects_severity_filter(app, db, sample_profile):
+    """Reconhecer com filtro de severidade só afeta os alertas correspondentes."""
+    crit = Alert(profile_id=sample_profile.id, alert_type=AlertType.HOST_DOWN,
+                 severity=Severity.CRITICAL, message="host down")
+    info = Alert(profile_id=sample_profile.id, alert_type=AlertType.NEW_DEVICE,
+                 severity=Severity.INFO, message="novo device")
+    db.session.add_all([crit, info])
+    db.session.commit()
+    crit_id, info_id = crit.id, info.id
+
+    client = _login_as(app, db, "operator")
+    resp = client.post("/alerts/acknowledge-all", data={
+        "profile_id": str(sample_profile.id),
+        "severity": "CRITICAL",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+
+    db.session.expire_all()
+    assert db.session.get(Alert, crit_id).acknowledged_at is not None
+    assert db.session.get(Alert, info_id).acknowledged_at is None  # INFO preservado
+
+
+def test_acknowledge_all_no_filter_acknowledges_all(app, db, sample_profile):
+    a1 = Alert(profile_id=sample_profile.id, alert_type=AlertType.HOST_DOWN,
+               severity=Severity.CRITICAL, message="a1")
+    a2 = Alert(profile_id=sample_profile.id, alert_type=AlertType.NEW_DEVICE,
+               severity=Severity.INFO, message="a2")
+    db.session.add_all([a1, a2])
+    db.session.commit()
+
+    client = _login_as(app, db, "operator")
+    client.post("/alerts/acknowledge-all", data={"profile_id": str(sample_profile.id)})
+
+    db.session.expire_all()
+    remaining = Alert.query.filter_by(profile_id=sample_profile.id).filter(
+        Alert.acknowledged_at.is_(None)).count()
+    assert remaining == 0
+
+
+def test_prometheus_metrics_disabled_by_default(app, db, sample_profile):
+    client = _login_as(app, db, "viewer")
+    resp = client.get("/api/metrics/prometheus")
+    assert resp.status_code == 404
+
+
+def test_prometheus_metrics_enabled_without_token(app, db, sample_profile):
+    _make_device_with_port(db, sample_profile, mac="AA:BB:CC:CA:FE:01")
+    client = app.test_client()  # sem login — endpoint é público quando habilitado
+    app.config["METRICS_ENABLED"] = True
+    app.config["METRICS_TOKEN"] = ""
+    try:
+        resp = client.get("/api/metrics/prometheus")
+        assert resp.status_code == 200
+        body = resp.get_data(as_text=True)
+        assert "netmonitor_up 1" in body
+        assert "netmonitor_devices_total{" in body
+        assert f'profile_id="{sample_profile.id}"' in body
+    finally:
+        app.config["METRICS_ENABLED"] = False
+        app.config["METRICS_TOKEN"] = ""
+
+
+def test_prometheus_metrics_token_required(app, db, sample_profile):
+    client = app.test_client()
+    app.config["METRICS_ENABLED"] = True
+    app.config["METRICS_TOKEN"] = "s3cr3t"
+    try:
+        assert client.get("/api/metrics/prometheus").status_code == 401
+        assert client.get("/api/metrics/prometheus?token=errado").status_code == 401
+        assert client.get("/api/metrics/prometheus?token=s3cr3t").status_code == 200
+        ok = client.get("/api/metrics/prometheus",
+                        headers={"Authorization": "Bearer s3cr3t"})
+        assert ok.status_code == 200
+    finally:
+        app.config["METRICS_ENABLED"] = False
+        app.config["METRICS_TOKEN"] = ""
 
 
 def test_port_toggle_authorized_requires_operator(app, db, sample_profile):

@@ -1,6 +1,21 @@
 {% extends "base.html" %}
 {% block title %}Alertas - NetMonitor{% endblock %}
 
+{# Cabeçalho de coluna clicável para ordenação. Preserva os filtros atuais e
+   alterna a direção ao reclicar a mesma coluna. #}
+{% macro sort_header(col, label) %}
+    {% set next_dir = 'asc' if (sort == col and direction == 'desc') else 'desc' %}
+    <a href="{{ url_for('alerts.alert_list', device=device_search, type=selected_type, severity=selected_severity, status=selected_status, sort=col, dir=next_dir) }}"
+       class="text-decoration-none text-reset d-inline-flex align-items-center gap-1">
+        {{ label }}
+        {% if sort == col %}
+            <i class="bi bi-caret-{{ 'up' if direction == 'asc' else 'down' }}-fill text-info"></i>
+        {% else %}
+            <i class="bi bi-arrow-down-up text-muted small opacity-50"></i>
+        {% endif %}
+    </a>
+{% endmacro %}
+
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
     <h2><i class="bi bi-bell"></i> Alertas</h2>
@@ -13,16 +28,63 @@
             <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end">
                 <li><a class="dropdown-item" href="{{ url_for('export.export_alerts', profile_id=active_profile.id, format='csv', status=selected_status) }}"><i class="bi bi-filetype-csv"></i> CSV</a></li>
                 <li><a class="dropdown-item" href="{{ url_for('export.export_alerts', profile_id=active_profile.id, format='json', status=selected_status) }}"><i class="bi bi-filetype-json"></i> JSON</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#exportEncModal"><i class="bi bi-shield-lock"></i> Cifrado (com senha)</a></li>
             </ul>
         </div>
+
+        <!-- Modal: Exportar alertas cifrado -->
+        <div class="modal fade" id="exportEncModal" tabindex="-1" aria-labelledby="exportEncModalLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content bg-dark text-light">
+                    <form method="POST" action="{{ url_for('export.export_alerts') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="profile_id" value="{{ active_profile.id }}">
+                        <input type="hidden" name="status" value="{{ selected_status }}">
+                        <div class="modal-header border-secondary">
+                            <h5 class="modal-title" id="exportEncModalLabel"><i class="bi bi-shield-lock"></i> Exportar Alertas Cifrado</h5>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="mb-3">
+                                <label class="form-label">Formato</label>
+                                <select name="format" class="form-select">
+                                    <option value="json">JSON</option>
+                                    <option value="csv">CSV</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Senha de criptografia</label>
+                                <input type="password" name="password" class="form-control" required minlength="8"
+                                       autocomplete="new-password" placeholder="Mínimo 8 caracteres">
+                                <div class="form-text text-muted">
+                                    O arquivo será cifrado (scrypt + Fernet) e baixado como <code>.enc</code>. Guarde a senha.
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer border-secondary">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                            <button type="submit" class="btn btn-primary"><i class="bi bi-download"></i> Exportar cifrado</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
         {% endif %}
+        {# Reconhece em massa. Reenvia os filtros ativos da lista para que o
+           "Reconhecer" atue só sobre o subconjunto que o usuário está vendo. #}
+        {% set has_filters = selected_type or selected_severity or device_search %}
         <form method="POST" action="{{ url_for('alerts.acknowledge_all') }}" class="d-inline">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             {% if active_profile %}
             <input type="hidden" name="profile_id" value="{{ active_profile.id }}">
             {% endif %}
-            <button type="submit" class="btn btn-sm btn-outline-success" onclick="return confirm('Reconhecer todos os alertas abertos?')">
-                <i class="bi bi-check-all"></i> Reconhecer Todos
+            <input type="hidden" name="type" value="{{ selected_type }}">
+            <input type="hidden" name="severity" value="{{ selected_severity }}">
+            <input type="hidden" name="device" value="{{ device_search }}">
+            <button type="submit" class="btn btn-sm btn-outline-success"
+                    onclick="return confirm('{{ 'Reconhecer os alertas abertos que batem com os filtros atuais?' if has_filters else 'Reconhecer todos os alertas abertos?' }}')">
+                <i class="bi bi-check-all"></i> {{ 'Reconhecer Filtrados' if has_filters else 'Reconhecer Todos' }}
             </button>
         </form>
     </div>
@@ -139,12 +201,12 @@
                         <input class="form-check-input" type="checkbox" id="selectAll"
                                title="Selecionar todos os abertos nesta página">
                     </th>
-                    <th>Severidade</th>
-                    <th>Tipo</th>
-                    <th>Dispositivo</th>
+                    <th>{{ sort_header('severity', 'Severidade') }}</th>
+                    <th>{{ sort_header('type', 'Tipo') }}</th>
+                    <th>{{ sort_header('device', 'Dispositivo') }}</th>
                     <th>Mensagem</th>
-                    <th>Criado em</th>
-                    <th>Status</th>
+                    <th>{{ sort_header('created', 'Criado em') }}</th>
+                    <th>{{ sort_header('status', 'Status') }}</th>
                     <th></th>
                 </tr>
             </thead>
@@ -212,7 +274,7 @@
 
 <!-- Paginação -->
 {% if pagination.pages > 1 %}
-{% set qs = "device=" ~ device_search ~ "&type=" ~ selected_type ~ "&severity=" ~ selected_severity ~ "&status=" ~ selected_status %}
+{% set qs = "device=" ~ device_search ~ "&type=" ~ selected_type ~ "&severity=" ~ selected_severity ~ "&status=" ~ selected_status ~ "&sort=" ~ sort ~ "&dir=" ~ direction %}
 <nav>
     <ul class="pagination pagination-sm justify-content-center">
         {% if pagination.has_prev %}

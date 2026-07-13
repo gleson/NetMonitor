@@ -13,6 +13,8 @@
             <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end">
                 <li><a class="dropdown-item" href="{{ url_for('export.export_devices', profile_id=active_profile.id, format='csv') }}"><i class="bi bi-filetype-csv"></i> CSV</a></li>
                 <li><a class="dropdown-item" href="{{ url_for('export.export_devices', profile_id=active_profile.id, format='json') }}"><i class="bi bi-filetype-json"></i> JSON</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#exportEncModal"><i class="bi bi-shield-lock"></i> Cifrado (com senha)</a></li>
             </ul>
             {% else %}
             <button class="btn btn-sm btn-outline-secondary dropdown-toggle" disabled
@@ -65,6 +67,44 @@
     </div>
 </div>
 
+<!-- Modal: Exportar cifrado -->
+<div class="modal fade" id="exportEncModal" tabindex="-1" aria-labelledby="exportEncModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark text-light">
+            <form method="POST" action="{{ url_for('export.export_devices') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                {% if active_profile %}<input type="hidden" name="profile_id" value="{{ active_profile.id }}">{% endif %}
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="exportEncModalLabel"><i class="bi bi-shield-lock"></i> Exportar Cifrado</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Formato</label>
+                        <select name="format" class="form-select">
+                            <option value="json">JSON</option>
+                            <option value="csv">CSV</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Senha de criptografia</label>
+                        <input type="password" name="password" class="form-control" required minlength="8"
+                               autocomplete="new-password" placeholder="Mínimo 8 caracteres">
+                        <div class="form-text text-muted">
+                            O arquivo será cifrado (scrypt + Fernet) e baixado como <code>.enc</code>.
+                            A <strong>mesma senha</strong> será exigida na importação — guarde-a, não há como recuperá-la.
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-download"></i> Exportar cifrado</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <!-- Modal: Importar dispositivos -->
 <div class="modal fade" id="importModal" tabindex="-1" aria-labelledby="importModalLabel" aria-hidden="true">
     <div class="modal-dialog">
@@ -85,13 +125,18 @@
                         </select>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label">Arquivo (.json ou .csv)</label>
-                        <input type="file" name="file" class="form-control" accept=".json,.csv" required>
+                        <label class="form-label">Arquivo (.json, .csv ou .enc)</label>
+                        <input type="file" name="file" class="form-control" accept=".json,.csv,.enc" required>
                         <div class="form-text text-muted">
                             Use o arquivo gerado pela exportação deste sistema. Tamanho máximo: 5 MB.<br>
                             Campos importados: MAC, nome, hostname, vendor, tipo, OS, situação, tags, notas, IP.<br>
                             Dispositivos existentes (mesmo MAC) terão os metadados atualizados.
                         </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Senha (apenas para arquivos cifrados <code>.enc</code>)</label>
+                        <input type="password" name="password" class="form-control"
+                               autocomplete="off" placeholder="Deixe em branco se o arquivo não for cifrado">
                     </div>
                 </div>
                 <div class="modal-footer border-secondary">
@@ -205,22 +250,20 @@
                 </td>
                 <td>{{ device.friendly_name or '-' }}</td>
                 <td>{{ device.hostname or '-' }}</td>
-                <td><code>{{ device.current_ip or '-' }}</code></td>
+                <td><code>{{ current_ips.get(device.id) or '-' }}</code></td>
                 <td><code>{{ device.mac }}</code></td>
                 <td>{{ device.vendor or '-' }}</td>
                 <td><span class="badge bg-secondary">{{ device.device_type.value }}</span></td>
                 <td>
                     {% set sit = device.situation or 'NI' %}
-                    {% if sit == 'NI' %}
-                    <span class="badge bg-secondary">NI</span>
-                    {% elif sit == 'Autorizado' %}
-                    <span class="badge bg-success">{{ sit }}</span>
-                    {% elif sit in ['Suspeito', 'Não Autorizado'] %}
+                    {% if sit == 'Ok' %}
+                    <span class="badge bg-success">Ok</span>
+                    {% elif sit == 'Não Autorizado' %}
                     <span class="badge bg-danger">{{ sit }}</span>
-                    {% elif sit == 'Identificado' %}
-                    <span class="badge bg-info text-dark">{{ sit }}</span>
+                    {% elif sit == 'NI' %}
+                    <span class="badge bg-secondary">NI</span>
                     {% else %}
-                    <span class="badge bg-primary">{{ sit }}</span>
+                    <span class="badge bg-secondary">{{ sit }}</span>
                     {% endif %}
                 </td>
                 <td>
@@ -254,8 +297,8 @@
                     {% endif %}
                 </td>
                 <td>
-                    {% set total_ports = device.open_ports_count %}
-                    {% set abertas = device.truly_open_ports_count %}
+                    {% set total_ports = port_counts.get(device.id, 0) %}
+                    {% set abertas = open_port_counts.get(device.id, 0) %}
                     {% if total_ports > 0 %}
                     <span title="{{ total_ports }} porta(s) no total: {{ abertas }} aberta(s), {{ total_ports - abertas }} filtrada(s)">
                         {{ total_ports }}/{% if abertas > 0 %}<span class="text-warning fw-bold">{{ abertas }}</span>{% else %}<span class="text-muted">0</span>{% endif %}

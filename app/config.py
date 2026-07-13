@@ -143,6 +143,15 @@ class Config:
     TLS_CHECK_INTERVAL_HOURS = int(os.environ.get("TLS_CHECK_INTERVAL_HOURS", 24))
     TLS_CERT_WARN_DAYS = int(os.environ.get("TLS_CERT_WARN_DAYS", 15))
 
+    # --- Métricas Prometheus ---
+    # Endpoint /api/metrics/prometheus (texto Prometheus, sem login). Desligado
+    # por padrão para não expor contagens da rede sem intenção explícita. Quando
+    # METRICS_TOKEN está definido, o scrape precisa enviá-lo em
+    # `Authorization: Bearer <token>` ou `?token=`; vazio deixa o endpoint aberto
+    # (cenário de scrape em localhost/rede confiável).
+    METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "0") == "1"
+    METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "")
+
     # --- Dedupe de alertas de porta ---
     # Não re-emite o mesmo alerta (device+porta) dentro desta janela, evitando
     # spam quando o estado oscila (flapping filtered<->open).

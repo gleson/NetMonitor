@@ -25,6 +25,14 @@ def alert_list():
     device_search = request.args.get("device", "").strip()
     page = request.args.get("page", 1, type=int)
 
+    # Ordenação por coluna (agrupa por severidade, tipo, dispositivo, etc.).
+    _valid_sorts = {"created", "severity", "type", "device", "status"}
+    sort = request.args.get("sort", "created")
+    if sort not in _valid_sorts:
+        sort = "created"
+    direction = "asc" if request.args.get("dir") == "asc" else "desc"
+    descending = direction == "desc"
+
     # Banner alert-danger no topo lista todos os HOST_DOWN prioritários abertos
     # (não respeita os filtros — esses casos precisam visibilidade incondicional).
     priority_q = Alert.query.filter(
@@ -54,6 +62,7 @@ def alert_list():
     elif status == "acknowledged":
         query = query.filter(Alert.acknowledged_at.isnot(None))
 
+    device_joined = False
     if device_search:
         like = f"%{device_search}%"
         # Subquery: device_ids cujo IP atual bate com a busca
@@ -73,9 +82,39 @@ def alert_list():
                 )
             )
         )
+        device_joined = True
 
-    # Prioritários (HOST_DOWN confirmado) primeiro; depois mais recentes.
-    query = query.order_by(Alert.is_priority.desc(), Alert.created_at.desc())
+    # Ordenação escolhida pelo usuário (clicando nos cabeçalhos da tabela).
+    def _dir(col):
+        return col.desc() if descending else col.asc()
+
+    if sort == "severity":
+        # Rank explícito: CRITICAL > WARNING > INFO (a ordem alfabética do enum
+        # não reflete a gravidade real).
+        sev_rank = db.case(
+            (Alert.severity == Severity.CRITICAL, 3),
+            (Alert.severity == Severity.WARNING, 2),
+            (Alert.severity == Severity.INFO, 1),
+            else_=0,
+        )
+        query = query.order_by(_dir(sev_rank), Alert.created_at.desc())
+    elif sort == "type":
+        query = query.order_by(_dir(Alert.alert_type), Alert.created_at.desc())
+    elif sort == "device":
+        if not device_joined:
+            query = query.outerjoin(Device, Alert.device_id == Device.id)
+        name_expr = db.func.coalesce(
+            Device.friendly_name, Device.hostname, Device.mac
+        )
+        query = query.order_by(_dir(name_expr), Alert.created_at.desc())
+    elif sort == "status":
+        # Agrupa abertos (acknowledged_at IS NULL) vs reconhecidos.
+        query = query.order_by(
+            _dir(Alert.acknowledged_at.is_(None)), Alert.created_at.desc()
+        )
+    else:  # "created" (padrão) — prioritários no topo, depois mais recentes.
+        query = query.order_by(Alert.is_priority.desc(), _dir(Alert.created_at))
+
     pagination = query.paginate(page=page, per_page=25, error_out=False)
 
     return render_template(
@@ -87,6 +126,8 @@ def alert_list():
         selected_severity=severity,
         selected_status=status,
         device_search=device_search,
+        sort=sort,
+        direction=direction,
         alert_types=AlertType,
         severities=Severity,
         priority_alerts=priority_alerts,
@@ -145,10 +186,12 @@ def acknowledge_selected():
 @login_required
 @require_role(ROLE_OPERATOR)
 def acknowledge_all():
-    """Marca todos os alertas abertos de um perfil específico como reconhecidos.
+    """Reconhece os alertas abertos de um perfil, respeitando os filtros ativos.
 
-    profile_id é obrigatório para evitar reconhecimento em massa acidental
-    entre perfis distintos.
+    profile_id é obrigatório para evitar reconhecimento em massa acidental entre
+    perfis distintos. Quando a lista está filtrada (tipo/severidade/dispositivo),
+    o formulário reenvia esses filtros e só o subconjunto visível é reconhecido —
+    sem filtros, o comportamento é reconhecer todos os abertos do perfil.
     """
     profile_id = request.form.get("profile_id", type=int)
 
@@ -164,22 +207,73 @@ def acknowledge_all():
         flash("Perfil não encontrado.", "danger")
         return redirect(request.referrer or url_for("alerts.alert_list"))
 
+    alert_type = request.form.get("type", "").strip()
+    severity = request.form.get("severity", "").strip()
+    device_search = request.form.get("device", "").strip()
+
     now = _utcnow()
-    updated = (
-        Alert.query
-        .filter(Alert.acknowledged_at.is_(None))
-        .filter_by(profile_id=profile_id)
-        .update({"acknowledged_at": now})
+    query = Alert.query.filter(
+        Alert.acknowledged_at.is_(None),
+        Alert.profile_id == profile_id,
     )
+
+    filters_desc = []
+    if alert_type:
+        try:
+            query = query.filter(Alert.alert_type == AlertType(alert_type))
+            filters_desc.append(f"tipo={alert_type}")
+        except ValueError:
+            pass
+    if severity:
+        try:
+            query = query.filter(Alert.severity == Severity(severity))
+            filters_desc.append(f"severidade={severity}")
+        except ValueError:
+            pass
+    if device_search:
+        like = f"%{device_search}%"
+        ip_sq = (
+            db.select(DeviceIp.device_id)
+            .where(DeviceIp.ip.ilike(like))
+            .scalar_subquery()
+        )
+        dev_sq = (
+            db.select(Device.id)
+            .where(
+                db.or_(
+                    Device.friendly_name.ilike(like),
+                    Device.hostname.ilike(like),
+                    Device.mac.ilike(like),
+                    Device.id.in_(ip_sq),
+                )
+            )
+            .scalar_subquery()
+        )
+        query = query.filter(Alert.device_id.in_(dev_sq))
+        filters_desc.append(f"device~{device_search}")
+
+    # synchronize_session=False: a atualização usa subquery (in_) e não roda mais
+    # nada nesta sessão antes do commit, então não há estado a sincronizar.
+    updated = query.update({"acknowledged_at": now}, synchronize_session=False)
     audit(
         "alert.acknowledge_all",
         "profile",
         profile_id,
-        details=f"{updated} alerta(s)",
+        details=(
+            f"{updated} alerta(s)"
+            + (f" (filtros: {', '.join(filters_desc)})" if filters_desc else "")
+        ),
     )
     db.session.commit()
-    flash(
-        f"{updated} alerta(s) do perfil '{profile.name}' reconhecidos.",
-        "success",
-    )
+    if filters_desc:
+        flash(
+            f"{updated} alerta(s) do perfil '{profile.name}' reconhecidos "
+            f"(filtros: {', '.join(filters_desc)}).",
+            "success",
+        )
+    else:
+        flash(
+            f"{updated} alerta(s) do perfil '{profile.name}' reconhecidos.",
+            "success",
+        )
     return redirect(request.referrer or url_for("alerts.alert_list"))

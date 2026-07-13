@@ -29,16 +29,14 @@
                         <th>Situação</th>
                         <td>
                             {% set sit = device.situation or 'NI' %}
-                            {% if sit == 'NI' %}
-                            <span class="badge bg-secondary">NI — Não Identificado</span>
-                            {% elif sit == 'Autorizado' %}
-                            <span class="badge bg-success">{{ sit }}</span>
-                            {% elif sit in ['Suspeito', 'Não Autorizado'] %}
+                            {% if sit == 'Ok' %}
+                            <span class="badge bg-success">Ok</span>
+                            {% elif sit == 'Não Autorizado' %}
                             <span class="badge bg-danger">{{ sit }}</span>
-                            {% elif sit == 'Identificado' %}
-                            <span class="badge bg-info text-dark">{{ sit }}</span>
+                            {% elif sit == 'NI' %}
+                            <span class="badge bg-secondary">Não Identificado</span>
                             {% else %}
-                            <span class="badge bg-primary">{{ sit }}</span>
+                            <span class="badge bg-secondary">{{ sit }}</span>
                             {% endif %}
                         </td>
                     </tr>
@@ -166,19 +164,13 @@
                     </div>
                     <div class="col-md-6 mb-2">
                         <label class="form-label">Situação</label>
-                        <input type="text" name="situation" class="form-control form-control-sm"
-                               value="{{ device.situation or 'NI' }}"
-                               list="situation-options" placeholder="NI">
-                        <datalist id="situation-options">
-                            <option value="NI">
-                            <option value="Identificado">
-                            <option value="Autorizado">
-                            <option value="Não Autorizado">
-                            <option value="Suspeito">
-                            <option value="Monitorado">
-                            <option value="Desativado">
-                        </datalist>
-                        <div class="form-text text-muted">NI = Não Identificado (padrão)</div>
+                        {% set sit = device.situation or 'NI' %}
+                        <select name="situation" class="form-select form-select-sm">
+                            <option value="NI" {{ 'selected' if sit == 'NI' }}>Não Identificado</option>
+                            <option value="Ok" {{ 'selected' if sit == 'Ok' }}>Ok</option>
+                            <option value="Não Autorizado" {{ 'selected' if sit == 'Não Autorizado' }}>Não Autorizado</option>
+                        </select>
+                        <div class="form-text text-muted">Não Autorizado dispara alerta quando o device fica online.</div>
                     </div>
                     <div class="col-md-6 mb-2">
                         <label class="form-label">Tags</label>
@@ -416,7 +408,45 @@
                         <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end">
                             <li><a class="dropdown-item" href="{{ url_for('export.export_vulns', device_id=device.id, format='csv') }}"><i class="bi bi-filetype-csv"></i> CSV</a></li>
                             <li><a class="dropdown-item" href="{{ url_for('export.export_vulns', device_id=device.id, format='json') }}"><i class="bi bi-filetype-json"></i> JSON</a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#exportVulnsEncModal"><i class="bi bi-shield-lock"></i> Cifrado (com senha)</a></li>
                         </ul>
+                    </div>
+
+                    <!-- Modal: Exportar vulnerabilidades cifrado -->
+                    <div class="modal fade" id="exportVulnsEncModal" tabindex="-1" aria-labelledby="exportVulnsEncModalLabel" aria-hidden="true">
+                        <div class="modal-dialog">
+                            <div class="modal-content bg-dark text-light">
+                                <form method="POST" action="{{ url_for('export.export_vulns', device_id=device.id) }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <div class="modal-header border-secondary">
+                                        <h5 class="modal-title" id="exportVulnsEncModalLabel"><i class="bi bi-shield-lock"></i> Exportar Vulnerabilidades Cifrado</h5>
+                                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                                    </div>
+                                    <div class="modal-body">
+                                        <div class="mb-3">
+                                            <label class="form-label">Formato</label>
+                                            <select name="format" class="form-select">
+                                                <option value="json">JSON</option>
+                                                <option value="csv">CSV</option>
+                                            </select>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">Senha de criptografia</label>
+                                            <input type="password" name="password" class="form-control" required minlength="8"
+                                                   autocomplete="new-password" placeholder="Mínimo 8 caracteres">
+                                            <div class="form-text text-muted">
+                                                O arquivo será cifrado (scrypt + Fernet) e baixado como <code>.enc</code>. Guarde a senha.
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="modal-footer border-secondary">
+                                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                                        <button type="submit" class="btn btn-primary"><i class="bi bi-download"></i> Exportar cifrado</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
                     </div>
                     {% endif %}
                 </div>
@@ -519,8 +549,9 @@ document.addEventListener('DOMContentLoaded', function() {
             results.classList.remove('d-none');
             output.textContent = formatScanResult(data, scanTypes);
             document.querySelectorAll('.scan-btn, #scanAllBtn').forEach(b => b.disabled = false);
-            // Recarrega se foi vuln, os_detect, ports ou mobile (atualiza tabelas e campos)
-            if (scanTypes.some(t => ['vuln', 'os_detect', 'ports', 'mobile'].includes(t))) {
+            // Recarrega se foi vuln, os_detect, ports ou mobile (atualiza tabelas e campos).
+            // Não recarrega se o port scan foi ignorado (host offline) — mantém a mensagem visível.
+            if (!data.ports_skipped && scanTypes.some(t => ['vuln', 'os_detect', 'ports', 'mobile'].includes(t))) {
                 setTimeout(() => window.location.reload(), 1500);
             }
         })
@@ -570,6 +601,10 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             if (m.note) lines.push(`\nNota: ${m.note}`);
             return lines.join('\n');
+        }
+        // Port scan ignorado por host offline — mensagem clara em vez de JSON cru.
+        if (data.ports_skipped) {
+            return '[IGNORADO] ' + data.ports_skipped;
         }
         return JSON.stringify(data, null, 2);
     }

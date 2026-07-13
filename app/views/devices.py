@@ -141,11 +141,17 @@ def device_list():
 
     pagination = query.paginate(page=page, per_page=25, error_out=False)
 
-    # IDs de devices desta página que têm porta crítica aberta
+    # Dados por device desta página em queries BATCHED (evita N+1: sem isto o
+    # template dispararia 3 queries por linha via device.current_ip /
+    # open_ports_count / truly_open_ports_count).
     from app.scanner.ports import CRITICAL_PORTS
     critical_device_ids: set[int] = set()
+    current_ips: dict[int, str] = {}
+    port_counts: dict[int, int] = {}       # portas não-fechadas (open + filtered)
+    open_port_counts: dict[int, int] = {}  # apenas estado 'open'
     if pagination.items:
         page_ids = [d.id for d in pagination.items]
+
         rows = (
             Port.query
             .with_entities(Port.device_id)
@@ -159,6 +165,29 @@ def device_list():
             .all()
         )
         critical_device_ids = {r.device_id for r in rows}
+
+        ip_rows = (
+            DeviceIp.query
+            .with_entities(DeviceIp.device_id, DeviceIp.ip)
+            .filter(DeviceIp.device_id.in_(page_ids), DeviceIp.is_current == True)
+            .all()
+        )
+        current_ips = {did: ip for did, ip in ip_rows}
+
+        count_rows = (
+            Port.query
+            .with_entities(
+                Port.device_id,
+                func.count(Port.id),
+                func.sum(db.case((Port.state == "open", 1), else_=0)),
+            )
+            .filter(Port.device_id.in_(page_ids), Port.last_seen_closed_at.is_(None))
+            .group_by(Port.device_id)
+            .all()
+        )
+        for did, total, open_cnt in count_rows:
+            port_counts[did] = total or 0
+            open_port_counts[did] = int(open_cnt or 0)
 
     return render_template(
         "devices/list.html",
@@ -175,6 +204,9 @@ def device_list():
         new_cutoff=new_cutoff,
         threshold_min=threshold_min,
         critical_device_ids=critical_device_ids,
+        current_ips=current_ips,
+        port_counts=port_counts,
+        open_port_counts=open_port_counts,
     )
 
 

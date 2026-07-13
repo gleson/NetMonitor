@@ -73,7 +73,7 @@
         </a>
     </div>
     <div class="col-md-4">
-        <a href="{{ url_for('alerts.alert_list') }}" class="text-decoration-none">
+        <a href="{{ url_for('alerts.alert_list', type='VULNERABILITY', status='open') }}" class="text-decoration-none">
             <div class="card bg-dark border-warning h-100">
                 <div class="card-body text-center">
                     <h6 class="card-subtitle text-muted mb-2">
@@ -252,10 +252,14 @@ document.addEventListener('DOMContentLoaded', function() {
     };
 
     function formatSlot(slot, granularity) {
-        // slot formato: "YYYY-MM-DD HH:00" (hora) ou "YYYY-MM-DD" (dia)
+        // slot já vem em horário LOCAL do servidor: "YYYY-MM-DD HH:00" (hora)
+        // ou "YYYY-MM-DD" (dia). NÃO reinterpretar como UTC (append 'Z') nem
+        // reconverter o fuso — isso aplicava o offset duas vezes e deslocava os
+        // rótulos horários (ex.: -3h em BRT). Formatação por string evita isso.
         if (granularity === 'hour') {
-            const dt = new Date(slot.replace(' ', 'T') + ':00Z');
-            return dt.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+            const [datePart, timePart] = slot.split(' ');
+            const [y, m, d] = datePart.split('-');
+            return `${d}/${m} ${timePart}`;
         } else {
             const [y, m, d] = slot.split('-');
             return `${d}/${m}`;

@@ -7,9 +7,60 @@
         <h2 class="mb-0"><i class="bi bi-clock-history"></i> Histórico de Portas</h2>
         <small class="text-muted">{{ device.display_name }} — {{ device.mac }}</small>
     </div>
-    <a href="{{ url_for('devices.device_detail', device_id=device.id) }}" class="btn btn-sm btn-outline-secondary">
-        <i class="bi bi-arrow-left"></i> Voltar ao Device
-    </a>
+    <div class="d-flex gap-2">
+        {% if all_ports %}
+        <div class="dropdown">
+            <button class="btn btn-sm btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown">
+                <i class="bi bi-download"></i> Exportar
+            </button>
+            <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end">
+                <li><a class="dropdown-item" href="{{ url_for('export.export_port_history', device_id=device.id, format='csv') }}"><i class="bi bi-filetype-csv"></i> CSV</a></li>
+                <li><a class="dropdown-item" href="{{ url_for('export.export_port_history', device_id=device.id, format='json') }}"><i class="bi bi-filetype-json"></i> JSON</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#exportPortsEncModal"><i class="bi bi-shield-lock"></i> Cifrado (com senha)</a></li>
+            </ul>
+        </div>
+        {% endif %}
+        <a href="{{ url_for('devices.device_detail', device_id=device.id) }}" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-arrow-left"></i> Voltar ao Device
+        </a>
+    </div>
+</div>
+
+<!-- Modal: Exportar histórico de portas cifrado -->
+<div class="modal fade" id="exportPortsEncModal" tabindex="-1" aria-labelledby="exportPortsEncModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark text-light">
+            <form method="POST" action="{{ url_for('export.export_port_history', device_id=device.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="exportPortsEncModalLabel"><i class="bi bi-shield-lock"></i> Exportar Histórico de Portas Cifrado</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Formato</label>
+                        <select name="format" class="form-select">
+                            <option value="json">JSON</option>
+                            <option value="csv">CSV</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Senha de criptografia</label>
+                        <input type="password" name="password" class="form-control" required minlength="8"
+                               autocomplete="new-password" placeholder="Mínimo 8 caracteres">
+                        <div class="form-text text-muted">
+                            O arquivo será cifrado (scrypt + Fernet) e baixado como <code>.enc</code>. Guarde a senha.
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-download"></i> Exportar cifrado</button>
+                </div>
+            </form>
+        </div>
+    </div>
 </div>
 
 <div class="row g-3">
