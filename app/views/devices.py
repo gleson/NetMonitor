@@ -9,7 +9,7 @@ from app.auth_utils import audit, require_role
 from app.extensions import db
 from app.models import (
     Device, DeviceIp, Port, Profile, DeviceType, Vulnerability,
-    ROLE_ADMIN, ROLE_OPERATOR, _utcnow,
+    ROLE_ADMIN, ROLE_OPERATOR, _utcnow, scan_days_since,
 )
 
 devices_bp = Blueprint("devices", __name__, template_folder="../templates/devices")
@@ -189,6 +189,14 @@ def device_list():
             port_counts[did] = total or 0
             open_port_counts[did] = int(open_cnt or 0)
 
+    # Dias monitorados (com Scan) por perfil, calculados uma vez por página
+    # para o uptime 30d — evita uma query por device no template.
+    uptime_window_start = now.date() - timedelta(days=29)
+    scan_days_by_profile = {
+        pid: scan_days_since(pid, uptime_window_start)
+        for pid in {d.profile_id for d in pagination.items}
+    }
+
     return render_template(
         "devices/list.html",
         devices=pagination.items,
@@ -207,6 +215,7 @@ def device_list():
         current_ips=current_ips,
         port_counts=port_counts,
         open_port_counts=open_port_counts,
+        scan_days_by_profile=scan_days_by_profile,
     )
 
 
@@ -267,7 +276,6 @@ def device_history():
 @login_required
 def device_detail(device_id):
     """Detalhe de um dispositivo."""
-    from flask import current_app
     device = db.session.get(Device, device_id) or abort(404)
     ips = DeviceIp.query.filter_by(device_id=device.id).order_by(DeviceIp.last_seen_at.desc()).all()
     open_ports = Port.query.filter_by(device_id=device.id).filter(
@@ -281,9 +289,8 @@ def device_detail(device_id):
         Vulnerability.resolved_at.is_(None)
     ).order_by(Vulnerability.is_vulnerable.desc(), Vulnerability.last_seen_at.desc()).all()
 
-    threshold_min = current_app.config.get("HOST_ONLINE_THRESHOLD_MINUTES", 70)
-    uptime_7d = device.uptime_estimate(days=7, online_threshold_minutes=threshold_min)
-    uptime_30d = device.uptime_estimate(days=30, online_threshold_minutes=threshold_min)
+    uptime_7d = device.uptime_details(days=7)
+    uptime_30d = device.uptime_details(days=30)
 
     return render_template(
         "devices/detail.html",

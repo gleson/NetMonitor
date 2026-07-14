@@ -221,7 +221,7 @@
                 <th>{{ sort_link('tags', 'Tags') }}</th>
                 <th>{{ sort_link('first_seen_at', 'Primeiro Visto') }}</th>
                 <th>{{ sort_link('last_seen_at', 'Último Visto') }}</th>
-                <th title="Disponibilidade estimada (30 dias)">Uptime 30d</th>
+                <th title="Disponibilidade estimada: dias online / dias monitorados (30 dias)">Uptime 30d</th>
                 <th>{{ sort_link('ports', 'Portas') }}</th>
                 <th></th>
             </tr>
@@ -285,7 +285,7 @@
                 <td>{{ device.first_seen_at|localtime }}</td>
                 <td>{{ device.last_seen_at|localtime }}</td>
                 <td>
-                    {% set u = device.uptime_estimate(30, threshold_min) %}
+                    {% set u = device.uptime_estimate(30, threshold_min, scan_days_by_profile.get(device.profile_id)) %}
                     {% if u is none %}
                     <span class="text-muted small">—</span>
                     {% elif u >= 0.95 %}

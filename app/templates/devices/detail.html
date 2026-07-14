@@ -66,20 +66,22 @@
                     <tr>
                         <th>Disponibilidade</th>
                         <td>
-                            {% macro uptime_badge(val, label) %}
+                            {% macro uptime_badge(detail, label) %}
+                                {% set val = detail.ratio %}
+                                {% set hint = detail.online_days ~ ' de ' ~ detail.monitored_days ~ ' dia(s) monitorado(s)' %}
                                 {% if val is none %}
                                 <span class="badge bg-secondary me-1">{{ label }}: —</span>
                                 {% elif val >= 0.95 %}
-                                <span class="badge bg-success me-1" title="{{ (val*100)|int }}%">{{ label }}: {{ (val*100)|int }}%</span>
+                                <span class="badge bg-success me-1" title="{{ hint }}">{{ label }}: {{ (val*100)|int }}%</span>
                                 {% elif val >= 0.80 %}
-                                <span class="badge bg-warning text-dark me-1" title="{{ (val*100)|int }}%">{{ label }}: {{ (val*100)|int }}%</span>
+                                <span class="badge bg-warning text-dark me-1" title="{{ hint }}">{{ label }}: {{ (val*100)|int }}%</span>
                                 {% else %}
-                                <span class="badge bg-danger me-1" title="{{ (val*100)|int }}%">{{ label }}: {{ (val*100)|int }}%</span>
+                                <span class="badge bg-danger me-1" title="{{ hint }}">{{ label }}: {{ (val*100)|int }}%</span>
                                 {% endif %}
                             {% endmacro %}
                             {{ uptime_badge(uptime_7d, '7d') }}
                             {{ uptime_badge(uptime_30d, '30d') }}
-                            <span class="text-muted small d-block mt-1">Dias distintos visto online / janela.</span>
+                            <span class="text-muted small d-block mt-1">Dias vistos online / dias monitorados (com scan) na janela. Dias com o monitor desligado não contam.</span>
                         </td>
                     </tr>
                     {% set online_dates = device.get_online_dates() %}

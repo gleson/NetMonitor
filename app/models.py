@@ -7,6 +7,7 @@ import os
 
 from cryptography.fernet import Fernet, InvalidToken
 from flask_login import UserMixin
+from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from app.extensions import db, login_manager
@@ -401,35 +402,59 @@ class Device(db.Model):
         self.online_dates = json.dumps(dates)
         return True
 
-    def uptime_estimate(self, days: int = 30, online_threshold_minutes: int = 60) -> float | None:
-        """Estima disponibilidade (0.0–1.0) no período ``days`` usando
-        ``online_dates``.
+    def uptime_details(self, days: int = 30, monitored_days: set[str] | None = None) -> dict:
+        """Calcula disponibilidade no período ``days`` usando ``online_dates``.
 
         Definição: uptime = (dias distintos visto online na janela) / (dias
-        da janela efetiva). A janela começa no MAIOR entre ``now - days`` e a
-        primeira data gravada para o device, evitando penalizar histórico
-        que não existia antes da ativação do tracking diário.
+        MONITORADOS na janela). Dia monitorado = dia com pelo menos um `Scan`
+        registrado para o perfil (união com os próprios dias online, que
+        implicam monitor ativo — cobre descoberta passiva sem Scan no dia).
+        Dias em que o NetMonitor esteve desligado não entram no denominador,
+        senão todo device herdaria o "uptime" do próprio monitor.
 
-        Retorna None enquanto não houver pelo menos uma data registrada — o
-        histórico se consolida a partir do primeiro scan após a feature ser
-        habilitada.
+        A janela começa no MAIOR entre ``now - days`` e a primeira data
+        gravada para o device, evitando penalizar histórico que não existia
+        antes da ativação do tracking diário.
+
+        ``monitored_days`` aceita um set pré-calculado (via
+        ``scan_days_since``) para evitar uma query por device em listagens.
+
+        Retorna ``{"ratio": float|None, "online_days": int, "monitored_days": int}``;
+        ``ratio`` é None enquanto não houver histórico.
         """
+        empty = {"ratio": None, "online_days": 0, "monitored_days": 0}
         today = _utcnow().date()
         period_start = today - timedelta(days=days - 1)
 
         online_dates = self.get_online_dates()
         if not online_dates:
-            return None
+            return empty
 
         earliest_recorded = _date.fromisoformat(min(online_dates))
         window_start = max(period_start, earliest_recorded)
-        effective_window = (today - window_start).days + 1
-        if effective_window < 1:
-            return None
+        if window_start > today:
+            return empty
 
         cutoff_str = window_start.isoformat()
-        distinct_days = sum(1 for d in set(online_dates) if d >= cutoff_str)
-        return max(0.0, min(1.0, distinct_days / effective_window))
+        online_set = {d for d in online_dates if d >= cutoff_str}
+        if monitored_days is None:
+            monitored_days = scan_days_since(self.profile_id, window_start)
+        monitored = {d for d in monitored_days if d >= cutoff_str} | online_set
+        if not monitored:
+            return empty
+
+        ratio = max(0.0, min(1.0, len(online_set) / len(monitored)))
+        return {"ratio": ratio, "online_days": len(online_set), "monitored_days": len(monitored)}
+
+    def uptime_estimate(self, days: int = 30, online_threshold_minutes: int = 60,
+                        monitored_days: set[str] | None = None) -> float | None:
+        """Estima disponibilidade (0.0–1.0) no período ``days``.
+
+        Atalho para ``uptime_details(...)["ratio"]``; ver a definição lá.
+        ``online_threshold_minutes`` é mantido por compatibilidade de
+        assinatura (não participa do cálculo diário).
+        """
+        return self.uptime_details(days=days, monitored_days=monitored_days)["ratio"]
 
     def __repr__(self):
         return f"<Device {self.mac} ({self.display_name})>"
@@ -509,6 +534,27 @@ class Scan(db.Model):
 
     def __repr__(self):
         return f"<Scan {self.scan_type.value} status={self.status.value}>"
+
+
+def scan_days_since(profile_id: int | None, start_date: _date) -> set[str]:
+    """Dias distintos (ISO ``YYYY-MM-DD``) com pelo menos um ``Scan`` do
+    perfil desde ``start_date`` — proxy de "dias em que o monitor rodou".
+
+    Usado como denominador do uptime diário (``Device.uptime_details``).
+    Limitado na prática por ``SCAN_RETENTION_DAYS`` (default 30, mesmo
+    tamanho da maior janela de uptime exibida).
+    """
+    if profile_id is None:
+        return set()
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    rows = (
+        db.session.query(func.date(Scan.started_at))
+        .filter(Scan.profile_id == profile_id, Scan.started_at >= start_dt)
+        .distinct()
+        .all()
+    )
+    # SQLite retorna str; outros backends retornam date — normaliza p/ ISO.
+    return {str(r[0]) for r in rows if r[0] is not None}
 
 
 # ---------------------------------------------------------------------------
