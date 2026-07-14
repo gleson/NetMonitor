@@ -1357,7 +1357,13 @@ def run_port_scan(profile_id: int):
                 # Marca timestamp do port scan no device (guarda cooldown de 24h).
                 # Pula enquanto tratamos como bug (queremos re-escanear logo), mas
                 # aplica quando desistimos — aí o resultado já é definitivo.
-                if host_found and (not ports_vanished_bug or gave_up_on_bug):
+                # Host que NÃO respondeu também entra no cooldown: sem isso o
+                # last_port_scanned_at fica NULL/antigo, o device volta à frente
+                # da fila (ordenada por esse campo) em toda reconstrução e
+                # monopoliza os ciclos — devices alcançáveis sofrem inanição.
+                # (Portas dele continuam intactas — só o cooldown se aplica.)
+                retrying_bug = host_found and ports_vanished_bug and not gave_up_on_bug
+                if not retrying_bug:
                     _device = db.session.get(Device, device_id)
                     if _device:
                         _device.last_port_scanned_at = now

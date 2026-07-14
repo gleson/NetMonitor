@@ -202,6 +202,59 @@ class TestPortsVanishedGiveUp:
                 scheduling._port_scan_retry_args.pop(did, None)
 
 
+class TestUnreachableHostCooldown:
+    """Host que não responde ao port scan deve entrar no cooldown de 24h.
+
+    Sem isso, last_port_scanned_at fica NULL/antigo, o device volta à frente
+    da fila (ordenada por esse campo) em toda reconstrução e monopoliza os
+    ciclos — devices alcançáveis sofrem inanição.
+    """
+
+    def test_unreachable_host_gets_cooldown_and_keeps_ports(
+        self, db, sample_profile, sample_range, monkeypatch
+    ):
+        from app.models import Device, DeviceIp, Port, _utcnow
+        from app.scanner import scheduling
+        import app.scanner.ports as ports_mod
+        import app.scanner.hosts as hosts_mod
+
+        now = _utcnow()
+        device = Device(
+            profile_id=sample_profile.id, mac="AA:BB:CC:DD:EE:99", last_seen_at=now,
+        )
+        db.session.add(device)
+        db.session.flush()
+        db.session.add(DeviceIp(
+            device_id=device.id, ip="192.168.1.60", is_current=True,
+            first_seen_at=now, last_seen_at=now,
+        ))
+        db.session.add(Port(
+            device_id=device.id, protocol="tcp", port=22, state="open",
+            first_open_at=now, last_seen_open_at=now,
+        ))
+        db.session.commit()
+        did = device.id
+
+        # Host inalcançável: reachability falha e o scan reporta host_found=False.
+        monkeypatch.setattr(hosts_mod, "is_host_reachable", lambda ip, *a, **k: (False, None))
+        monkeypatch.setattr(ports_mod, "scan_ports_for_host", lambda *a, **k: ([], False))
+
+        try:
+            scheduling.run_port_scan(sample_profile.id)
+
+            refreshed = db.session.get(Device, did)
+            # Cooldown aplicado mesmo sem resposta (evita inanição da fila)...
+            assert refreshed.last_port_scanned_at is not None
+            # ...mas as portas conhecidas permanecem intactas (invariante).
+            open_ports = Port.query.filter_by(device_id=did).filter(
+                Port.last_seen_closed_at.is_(None)
+            ).count()
+            assert open_ports == 1
+        finally:
+            with scheduling._port_scan_queues_lock:
+                scheduling._port_scan_queues.pop(sample_profile.id, None)
+
+
 class TestOutputIndicatesVulnerable:
     """Interpretação da saída de scripts NSE de vulnerabilidade (#9)."""
 
