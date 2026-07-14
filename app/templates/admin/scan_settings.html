@@ -29,12 +29,13 @@
             </div>
 
             <hr class="border-secondary my-4">
-            <h6 class="text-muted mb-3"><i class="bi bi-broadcast"></i> Descoberta passiva (ARP)</h6>
+            <h6 class="text-muted mb-3"><i class="bi bi-broadcast"></i> Descoberta passiva (ARP + multicast)</h6>
             <div class="form-check form-switch mb-2">
                 <input type="checkbox" name="passive_arp_enabled" class="form-check-input" id="passiveArp"
                        {% if passive_enabled %}checked{% endif %} {% if not has_root %}disabled{% endif %}>
                 <label class="form-check-label" for="passiveArp">
-                    Escutar tráfego ARP para detectar dispositivos novos em segundos
+                    Escutar tráfego ARP e multicast/broadcast (mDNS, SSDP, LLMNR, NetBIOS, DHCP)
+                    para detectar dispositivos novos em segundos
                 </label>
             </div>
             <div class="form-text text-muted mb-3">

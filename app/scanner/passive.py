@@ -1,9 +1,12 @@
-"""Descoberta passiva de dispositivos por sniffing de ARP.
+"""Descoberta passiva de dispositivos por sniffing de ARP e multicast.
 
 Complementa o host discovery ativo (ARP/nmap a cada ~45 min): escutando o
-tráfego ARP da sub-rede em background, um dispositivo novo aparece em segundos
-em vez de esperar o próximo ciclo. Também atende ativos sensíveis (OT/IoT) que
-não toleram varredura ativa — aqui só observamos pacotes que eles já emitem.
+tráfego ARP e os protocolos "faladores" de multicast/broadcast da sub-rede
+(mDNS, SSDP, LLMNR, NetBIOS, DHCP) em background, um dispositivo novo aparece
+em segundos em vez de esperar o próximo ciclo. O ramo multicast cobre devices
+que quase não emitem ARP (ex.: só anunciam serviços via mDNS na 5353) e ativos
+sensíveis (OT/IoT) que não toleram varredura ativa — aqui só observamos
+pacotes que eles já emitem.
 
 Requisitos e travas:
 - Precisa de root (sniff usa raw sockets) — sem root, não inicia.
@@ -45,6 +48,14 @@ _INGEST_COOLDOWN_S = 60.0
 # Intervalo do worker que drena o buffer.
 _WORKER_INTERVAL_S = 5.0
 
+# Filtro BPF do sniffer: ARP + protocolos de descoberta que devices emitem
+# espontaneamente por multicast/broadcast — mDNS (5353), LLMNR (5355),
+# SSDP (1900), NetBIOS (137/138) e DHCP (67/68).
+_SNIFF_FILTER = (
+    "arp or (udp and (port 5353 or port 5355 or port 1900 "
+    "or port 137 or port 138 or port 67 or port 68))"
+)
+
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -63,7 +74,10 @@ def is_passive_discovery_enabled(app) -> bool:
     default = bool(app.config.get("PASSIVE_ARP_DISCOVERY_ENABLED", False))
     try:
         from app.models import AppSetting
-        raw = AppSetting.get_value("passive_arp_enabled", "")
+        # app_context próprio: no startup somos chamados fora de contexto
+        # (após o bloco `with app.app_context()` do _init_scheduler).
+        with app.app_context():
+            raw = AppSetting.get_value("passive_arp_enabled", "")
         if raw == "":
             return default
         return raw in ("1", "true", "True", "on")
@@ -80,24 +94,55 @@ def is_passive_discovery_running() -> bool:
 # Sniffer
 # ---------------------------------------------------------------------------
 
-def _on_arp_packet(pkt):
-    """Callback do sniffer (thread do scapy). Mantém-se mínimo: só bufferiza."""
+def _is_local_only_dst(dst: str) -> bool:
+    """True se o destino é multicast/broadcast (tráfego que nunca foi roteado).
+
+    Em unicast roteado, o MAC de origem do quadro é o do roteador, não o do
+    device dono do IP — parear os dois criaria devices falsos. Multicast
+    link-local e broadcast só circulam no segmento L2 de origem, então o MAC
+    de origem é do próprio emissor.
+    """
     try:
+        first = int(dst.split(".", 1)[0])
+    except (ValueError, AttributeError):
+        return False
+    return (224 <= first <= 239) or dst == "255.255.255.255" or dst.endswith(".255")
+
+
+def _on_packet(pkt):
+    """Callback do sniffer (thread do scapy). Mantém-se mínimo: só bufferiza.
+
+    Aceita ARP (request/reply) e UDP multicast/broadcast (mDNS, SSDP, LLMNR,
+    NetBIOS, DHCP) — em ambos os casos extrai o par (IP origem, MAC origem).
+    """
+    try:
+        from scapy.layers.inet import IP, UDP
         from scapy.layers.l2 import ARP
-        if not pkt.haslayer(ARP):
+
+        if pkt.haslayer(ARP):
+            arp = pkt[ARP]
+            ip = arp.psrc
+            mac = (arp.hwsrc or "").upper()
+        elif pkt.haslayer(IP) and pkt.haslayer(UDP):
+            if not _is_local_only_dst(pkt[IP].dst):
+                return
+            ip = pkt[IP].src
+            # MAC de origem do quadro Ethernet (camada mais externa).
+            mac = (getattr(pkt, "src", "") or "").upper()
+        else:
             return
-        arp = pkt[ARP]
-        ip = arp.psrc
-        mac = (arp.hwsrc or "").upper()
+
         # Ignora endereços nulos/broadcast e MAC inválido — validação forte
-        # acontece na ingestão.
-        if not ip or ip == "0.0.0.0" or not mac or mac == "00:00:00:00:00:00":
+        # acontece na ingestão. (src 0.0.0.0 acontece em DHCP DISCOVER.)
+        if not ip or ip == "0.0.0.0" or not mac or mac in (
+            "00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF",
+        ):
             return
         with _buffer_lock:
             _buffer[mac] = ip
     except Exception:
         # Nunca deixa uma exceção escapar do callback do sniffer.
-        logger.debug("Erro ao processar pacote ARP", exc_info=True)
+        logger.debug("Erro ao processar pacote capturado", exc_info=True)
 
 
 def _drain_buffer() -> list[tuple[str, str]]:
@@ -233,7 +278,7 @@ def _ingest_observations(observations: list[tuple[str, str]]):
                 device_id=device.id,
                 alert_type=AlertType.NEW_DEVICE,
                 severity=Severity.INFO,
-                message=f"Novo dispositivo (descoberta passiva ARP): {mac} ({ip})",
+                message=f"Novo dispositivo (descoberta passiva): {mac} ({ip})",
             )
             db.session.add(new_dev_alert)
             _maybe_notify(new_dev_alert, profile, device)
@@ -273,7 +318,7 @@ def _ingest_observations(observations: list[tuple[str, str]]):
                 device_id=device.id,
                 alert_type=AlertType.NEW_IP_FOR_MAC,
                 severity=Severity.WARNING,
-                message=f"Device {device.display_name} ({mac}) mudou de IP (ARP passivo): {current_ip.ip} -> {ip}",
+                message=f"Device {device.display_name} ({mac}) mudou de IP (descoberta passiva): {current_ip.ip} -> {ip}",
             )
             db.session.add(alert)
             _maybe_notify(alert, profile, device)
@@ -324,15 +369,15 @@ def start_passive_discovery(app) -> bool:
     _worker_thread.start()
 
     try:
-        _sniffer = AsyncSniffer(filter="arp", prn=_on_arp_packet, store=False)
+        _sniffer = AsyncSniffer(filter=_SNIFF_FILTER, prn=_on_packet, store=False)
         _sniffer.start()
     except Exception:
-        logger.exception("Falha ao iniciar o sniffer ARP — abortando descoberta passiva.")
+        logger.exception("Falha ao iniciar o sniffer passivo — abortando descoberta passiva.")
         _stop_event.set()
         _sniffer = None
         return False
 
-    logger.info("Descoberta passiva ARP iniciada (sniffer + worker).")
+    logger.info("Descoberta passiva ARP+multicast iniciada (sniffer + worker).")
     return True
 
 

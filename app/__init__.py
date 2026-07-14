@@ -236,8 +236,22 @@ def _acquire_scheduler_lock(app: Flask) -> bool:
     lock_path = os.path.join(tempfile.gettempdir(), f"netmonitor-scheduler-{digest}.lock")
 
     try:
-        fd = open(lock_path, "w")
+        # Abre SEM O_CREAT quando o arquivo já existe: com fs.protected_regular
+        # (padrão em Fedora/Ubuntu), open(O_CREAT) sobre arquivo de OUTRO dono
+        # em diretório sticky (/tmp) falha com EACCES — inclusive para root.
+        # Sem O_CREAT a restrição não se aplica.
+        try:
+            fd = open(lock_path, "r+")
+        except FileNotFoundError:
+            fd = open(lock_path, "w")
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except PermissionError:
+        app.logger.warning(
+            "Sem permissão para abrir o lockfile %s (criado por outro usuário). "
+            "Remova o arquivo ou execute como o mesmo usuário. "
+            "Este processo servirá requisições SEM scheduler.", lock_path,
+        )
+        return False
     except (OSError, BlockingIOError):
         app.logger.info(
             "Scheduler já iniciado por outro processo (lock %s ocupado). "
