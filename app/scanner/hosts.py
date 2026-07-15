@@ -38,6 +38,23 @@ _LIVENESS_PROBE_PORTS: tuple[int, ...] = tuple(dict.fromkeys([
     139, 135, 23, 3306, 5432, 8000, 8081, 9090,
 ]))
 
+# Portas do probe PROFUNDO de liveness (aproximação do nmap --top-ports 100,
+# mais portas altas raramente cobertas por regras de firewall). Usado quando os
+# métodos rápidos falham: um host cujo firewall dropa ICMP e filtra as portas
+# comuns ainda costuma responder RST (connection refused) em portas fora das
+# regras — o que prova que ele está online. Sem esse probe, um host firewalled
+# em sub-rede roteada (sem ARP) é declarado offline e nunca escaneado.
+_DEEP_PROBE_PORTS: tuple[int, ...] = tuple(dict.fromkeys([
+    *_LIVENESS_PROBE_PORTS,
+    9, 13, 21, 25, 26, 37, 79, 81, 88, 106, 110, 111, 113, 119, 143, 144,
+    179, 199, 389, 427, 444, 465, 513, 514, 515, 543, 544, 548, 554, 587,
+    631, 646, 873, 990, 993, 995, 1025, 1026, 1027, 1028, 1029, 1110, 1434,
+    1720, 1723, 1755, 1900, 2000, 2001, 2049, 2121, 2717, 3000, 3128, 3986,
+    4899, 5000, 5009, 5051, 5060, 5101, 5190, 5357, 5631, 5666, 5800, 6000,
+    6001, 6646, 7070, 8008, 8009, 9100, 9999, 10000, 32768,
+    49152, 49153, 49154, 49155, 49156, 49157,
+]))
+
 
 @dataclass
 class HostInfo:
@@ -522,7 +539,11 @@ def scan_host_with_icmp(ip: str, timeout: int = 2) -> bool:
         return False
 
 
-def _tcp_probe(ip: str, timeout: float = 1.5) -> int | None:
+def _tcp_probe(
+    ip: str,
+    timeout: float = 1.5,
+    probe_ports: tuple[int, ...] = _LIVENESS_PROBE_PORTS,
+) -> int | None:
     """Tenta conexão TCP em portas comuns em paralelo.
 
     Retorna o número da primeira porta que responder (aberta OU com
@@ -549,14 +570,14 @@ def _tcp_probe(ip: str, timeout: float = 1.5) -> int | None:
     # Todas as portas são sondadas em paralelo; o custo de wall-clock é limitado
     # pelo timeout (não pela quantidade de portas), então ampliar a lista não
     # deixa o probe mais lento — só aumenta a chance de detectar o host.
-    with ThreadPoolExecutor(max_workers=min(len(_LIVENESS_PROBE_PORTS), 32)) as executor:
-        for result in executor.map(try_port, _LIVENESS_PROBE_PORTS):
+    with ThreadPoolExecutor(max_workers=min(len(probe_ports), 32)) as executor:
+        for result in executor.map(try_port, probe_ports):
             if result is not None:
                 return result
     return None
 
 
-def is_host_reachable(ip: str, timeout: int = 2) -> tuple[bool, str]:
+def is_host_reachable(ip: str, timeout: int = 2, deep: bool = False) -> tuple[bool, str]:
     """Verifica se um host está alcançável usando múltiplos métodos.
 
     Ordem de tentativa:
@@ -564,6 +585,11 @@ def is_host_reachable(ip: str, timeout: int = 2) -> tuple[bool, str]:
     2. Tabela ARP — dispositivos móveis/IoT bloqueiam ICMP mas devem responder
        ARP (protocolo L2 obrigatório). Lido após o ping para pegar entradas novas.
     3. TCP connect — funciona com ICMP bloqueado se o host tiver alguma porta acessível.
+    4. (apenas com ``deep=True``) TCP connect na lista ampla _DEEP_PROBE_PORTS —
+       pega hosts firewalled que dropam ICMP e filtram as portas comuns, mas
+       respondem RST em alguma porta fora das regras. Mais lento (alguns
+       segundos); use nos fluxos onde um falso "offline" é caro (gate do port
+       scan, confirmação de HOST_DOWN).
 
     Returns:
         (is_up, method): is_up indica se o host foi alcançado;
@@ -583,6 +609,12 @@ def is_host_reachable(ip: str, timeout: int = 2) -> tuple[bool, str]:
     tcp_port = _tcp_probe(ip, timeout=float(timeout))
     if tcp_port is not None:
         return True, f"tcp/{tcp_port}"
+
+    # 4. Probe profundo — última chance antes de declarar o host offline.
+    if deep:
+        deep_port = _tcp_probe(ip, timeout=float(timeout), probe_ports=_DEEP_PROBE_PORTS)
+        if deep_port is not None:
+            return True, f"tcp-deep/{deep_port}"
 
     return False, ""
 

@@ -108,6 +108,9 @@ def device_list():
     current_ip_sq = (
         db.select(DeviceIp.ip)
         .where(DeviceIp.device_id == Device.id, DeviceIp.is_current == True)
+        # Devices multi-IP têm vários IPs atuais — usa o mais recente na ordenação.
+        .order_by(DeviceIp.last_seen_at.desc())
+        .limit(1)
         .correlate(Device)
         .scalar_subquery()
     )
@@ -170,9 +173,13 @@ def device_list():
             DeviceIp.query
             .with_entities(DeviceIp.device_id, DeviceIp.ip)
             .filter(DeviceIp.device_id.in_(page_ids), DeviceIp.is_current == True)
+            .order_by(DeviceIp.last_seen_at.asc())
             .all()
         )
-        current_ips = {did: ip for did, ip in ip_rows}
+        # Devices multi-IP: exibe todos os IPs atuais separados por vírgula
+        # (o mais recente por último graças à ordenação acima).
+        for did, ip in ip_rows:
+            current_ips[did] = f"{current_ips[did]}, {ip}" if did in current_ips else ip
 
         count_rows = (
             Port.query
@@ -424,6 +431,7 @@ def device_edit(device_id):
     device.notes = request.form.get("notes", "").strip()
     device.situation = request.form.get("situation", "NI").strip() or "NI"
     device.alert_on_down = request.form.get("alert_on_down") == "on"
+    device.is_multi_ip = request.form.get("is_multi_ip") == "on"
     # Normaliza tags: remove espaços, minúsculas, separa por vírgula
     raw_tags = request.form.get("tags", "").strip()
     device.tags = ",".join(t.strip().lower() for t in raw_tags.split(",") if t.strip())
@@ -486,7 +494,13 @@ def device_scan(device_id):
     if not device:
         return jsonify({"error": "Dispositivo não encontrado."}), 404
 
-    current_dip = DeviceIp.query.filter_by(device_id=device.id, is_current=True).first()
+    # Mesma ordenação usada pelo scan sob demanda (devices multi-IP têm vários
+    # DeviceIp atuais) — garante que o IP autorizado é o IP que será escaneado.
+    current_dip = (
+        DeviceIp.query.filter_by(device_id=device.id, is_current=True)
+        .order_by(DeviceIp.last_seen_at.desc())
+        .first()
+    )
     if current_dip and not _ip_in_profile_ranges(current_dip.ip, device.profile_id):
         return jsonify({
             "error": f"IP {current_dip.ip} fora dos ranges autorizados do perfil.",

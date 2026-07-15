@@ -335,6 +335,10 @@ class Device(db.Model):
     tags = db.Column(db.String(500), default="")  # tags separadas por vírgula
     notes = db.Column(db.Text, default="")
     alert_on_down = db.Column(db.Boolean, default=False, nullable=False)
+    # Device legitimamente multi-homed (ex.: roteador/gateway presente em várias
+    # redes com o mesmo MAC). Vários DeviceIp podem ser is_current=True ao mesmo
+    # tempo e a alternância entre eles não gera alerta NEW_IP_FOR_MAC.
+    is_multi_ip = db.Column(db.Boolean, default=False, nullable=False)
     first_seen_at = db.Column(db.DateTime, default=_utcnow)
     last_seen_at = db.Column(db.DateTime, default=_utcnow)
     last_port_scanned_at = db.Column(db.DateTime, nullable=True)
@@ -351,8 +355,22 @@ class Device(db.Model):
     @property
     def current_ip(self):
         """Retorna o IP atual do dispositivo (o mais recente marcado como current)."""
-        dip = DeviceIp.query.filter_by(device_id=self.id, is_current=True).first()
+        dip = (
+            DeviceIp.query.filter_by(device_id=self.id, is_current=True)
+            .order_by(DeviceIp.last_seen_at.desc())
+            .first()
+        )
         return dip.ip if dip else None
+
+    @property
+    def current_ips(self) -> list[str]:
+        """Todos os IPs atuais — devices multi-IP (is_multi_ip) têm mais de um."""
+        rows = (
+            DeviceIp.query.filter_by(device_id=self.id, is_current=True)
+            .order_by(DeviceIp.last_seen_at.desc())
+            .all()
+        )
+        return [r.ip for r in rows]
 
     @property
     def open_ports_count(self):

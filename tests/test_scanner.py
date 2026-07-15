@@ -310,3 +310,209 @@ class TestOutputIndicatesVulnerable:
     def test_empty_output(self):
         assert self._f("") is False
         assert self._f(None) is False
+
+
+class TestDeepLivenessProbe:
+    """Probe profundo de liveness: hosts firewalled (ICMP dropado + portas
+    comuns filtradas) devem ser detectados via RST em portas da lista ampla.
+    """
+
+    def test_deep_probe_finds_firewalled_host(self, monkeypatch):
+        import app.scanner.hosts as hosts_mod
+
+        monkeypatch.setattr(hosts_mod, "scan_host_with_icmp", lambda ip, timeout=2: False)
+        monkeypatch.setattr(hosts_mod, "_read_mac_from_arp_table", lambda ip: "")
+
+        def fake_tcp_probe(ip, timeout=1.5, probe_ports=hosts_mod._LIVENESS_PROBE_PORTS):
+            # Só a lista ampla encontra o host (RST em porta alta não filtrada).
+            if probe_ports == hosts_mod._DEEP_PROBE_PORTS:
+                return 49152
+            return None
+
+        monkeypatch.setattr(hosts_mod, "_tcp_probe", fake_tcp_probe)
+
+        # Sem deep (comportamento antigo): host declarado offline.
+        assert hosts_mod.is_host_reachable("10.0.0.9") == (False, "")
+        # Com deep: encontrado via probe profundo.
+        assert hosts_mod.is_host_reachable("10.0.0.9", deep=True) == (True, "tcp-deep/49152")
+
+    def test_deep_list_is_superset_of_liveness_list(self):
+        from app.scanner.hosts import _DEEP_PROBE_PORTS, _LIVENESS_PROBE_PORTS
+
+        assert set(_LIVENESS_PROBE_PORTS) <= set(_DEEP_PROBE_PORTS)
+        assert len(_DEEP_PROBE_PORTS) > len(_LIVENESS_PROBE_PORTS)
+
+
+class TestOnDemandZeroPortsRetry:
+    """Scan sob demanda com 0 portas em host online: tenta os tipos de scan
+    alternativos antes de aceitar o zero (firewalls que dropam o probe
+    original costumam responder a outro tipo).
+    """
+
+    def _mk_device(self, db, profile, mac, ip):
+        from app.models import Device, DeviceIp, _utcnow
+        now = _utcnow()
+        device = Device(profile_id=profile.id, mac=mac, last_seen_at=now)
+        db.session.add(device)
+        db.session.flush()
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip, is_current=True,
+            first_seen_at=now, last_seen_at=now,
+        ))
+        db.session.commit()
+        return device
+
+    def test_alternate_scan_recovers_filtered_ports(
+        self, db, sample_profile, sample_range, monkeypatch
+    ):
+        from app.models import Port
+        from app.scanner import scheduling
+        from app.scanner.ports import PortInfo
+        import app.scanner.ports as ports_mod
+        import app.scanner.hosts as hosts_mod
+
+        device = self._mk_device(db, sample_profile, "AA:BB:CC:DD:EE:66", "192.168.1.70")
+
+        monkeypatch.setattr(hosts_mod, "is_host_reachable", lambda ip, *a, **k: (True, "icmp"))
+
+        call_args = []
+
+        def fake_scan(ip, ports=None, arguments=None):
+            call_args.append(arguments)
+            if arguments is None:
+                return [], True  # scan padrão: 0 portas (probe dropado)
+            return (
+                [PortInfo(port=443, protocol="tcp", state="filtered", service_name="https")],
+                True,
+            )
+
+        monkeypatch.setattr(ports_mod, "scan_ports_for_host", fake_scan)
+
+        results = scheduling.run_on_demand_scan(device.id, ["ports"])
+
+        # 1 scan padrão + 1 alternativo (para no primeiro que encontra algo).
+        assert call_args[0] is None
+        assert len(call_args) == 2
+        assert results["ports"] and results["ports"][0]["state"] == "filtered"
+        assert "alternativa" in results.get("ports_note", "")
+        # A porta reencontrada foi gravada no banco.
+        assert Port.query.filter_by(device_id=device.id, port=443).count() == 1
+
+    def test_note_when_all_alternates_return_zero(
+        self, db, sample_profile, sample_range, monkeypatch
+    ):
+        from app.scanner import scheduling
+        import app.scanner.ports as ports_mod
+        import app.scanner.hosts as hosts_mod
+
+        device = self._mk_device(db, sample_profile, "AA:BB:CC:DD:EE:65", "192.168.1.71")
+
+        monkeypatch.setattr(hosts_mod, "is_host_reachable", lambda ip, *a, **k: (True, "icmp"))
+
+        call_count = {"n": 0}
+
+        def fake_scan(ip, ports=None, arguments=None):
+            call_count["n"] += 1
+            return [], True
+
+        monkeypatch.setattr(ports_mod, "scan_ports_for_host", fake_scan)
+
+        results = scheduling.run_on_demand_scan(device.id, ["ports"])
+
+        alternates = len(scheduling._alternate_scan_sequence())
+        assert call_count["n"] == 1 + alternates  # padrão + todos os alternativos
+        assert results["ports"] == []
+        assert "0 portas" in results.get("ports_note", "")
+
+
+class TestMultiIpDevice:
+    """Devices multi-IP (roteador/gateway com o mesmo MAC em várias redes):
+    todos os IPs conhecidos ficam is_current=True e a alternância entre eles
+    não gera alerta NEW_IP_FOR_MAC.
+    """
+
+    def _mk_device(self, db, profile, mac, ip, multi=False):
+        from app.models import Device, DeviceIp, _utcnow
+        now = _utcnow()
+        device = Device(
+            profile_id=profile.id, mac=mac, last_seen_at=now, is_multi_ip=multi,
+        )
+        db.session.add(device)
+        db.session.flush()
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip, is_current=True,
+            first_seen_at=now, last_seen_at=now,
+        ))
+        db.session.commit()
+        return device
+
+    def test_multi_ip_keeps_all_ips_current_without_flip(self, db, sample_profile):
+        from app.models import Alert, AlertType, DeviceIp, Severity, _utcnow
+        from app.scanner.scheduling import _upsert_device_ip
+
+        device = self._mk_device(
+            db, sample_profile, "AA:BB:CC:DD:EE:55", "192.168.100.1", multi=True,
+        )
+
+        # Visto em um segundo IP: adiciona como atual; alerta é só INFO.
+        _upsert_device_ip(sample_profile, device, "192.168.50.1", _utcnow())
+        db.session.commit()
+
+        current = DeviceIp.query.filter_by(device_id=device.id, is_current=True).all()
+        assert {c.ip for c in current} == {"192.168.100.1", "192.168.50.1"}
+        alerts = Alert.query.filter_by(
+            device_id=device.id, alert_type=AlertType.NEW_IP_FOR_MAC,
+        ).all()
+        assert len(alerts) == 1
+        assert alerts[0].severity == Severity.INFO
+
+        # Visto de novo em qualquer IP conhecido: nenhum alerta, nenhum flip.
+        _upsert_device_ip(sample_profile, device, "192.168.100.1", _utcnow())
+        _upsert_device_ip(sample_profile, device, "192.168.50.1", _utcnow())
+        db.session.commit()
+
+        assert Alert.query.filter_by(
+            device_id=device.id, alert_type=AlertType.NEW_IP_FOR_MAC,
+        ).count() == 1
+        assert DeviceIp.query.filter_by(
+            device_id=device.id, is_current=True,
+        ).count() == 2
+
+    def test_single_ip_device_still_flips_and_warns(self, db, sample_profile):
+        from app.models import Alert, AlertType, DeviceIp, Severity, _utcnow
+        from app.scanner.scheduling import _upsert_device_ip
+
+        device = self._mk_device(
+            db, sample_profile, "AA:BB:CC:DD:EE:54", "192.168.100.20", multi=False,
+        )
+
+        _upsert_device_ip(sample_profile, device, "192.168.100.21", _utcnow())
+        db.session.commit()
+
+        current = DeviceIp.query.filter_by(device_id=device.id, is_current=True).all()
+        assert [c.ip for c in current] == ["192.168.100.21"]
+
+        alerts = Alert.query.filter_by(
+            device_id=device.id, alert_type=AlertType.NEW_IP_FOR_MAC,
+        ).all()
+        assert len(alerts) == 1
+        assert alerts[0].severity == Severity.WARNING
+        assert "mudou de IP" in alerts[0].message
+
+    def test_unmarking_multi_ip_demotes_extra_currents(self, db, sample_profile):
+        from app.models import DeviceIp, _utcnow
+        from app.scanner.scheduling import _upsert_device_ip
+
+        device = self._mk_device(
+            db, sample_profile, "AA:BB:CC:DD:EE:53", "192.168.100.1", multi=True,
+        )
+        _upsert_device_ip(sample_profile, device, "192.168.50.1", _utcnow())
+        db.session.commit()
+
+        # Usuário desliga a flag: na próxima vez visto, sobra só um IP atual.
+        device.is_multi_ip = False
+        _upsert_device_ip(sample_profile, device, "192.168.50.1", _utcnow())
+        db.session.commit()
+
+        current = DeviceIp.query.filter_by(device_id=device.id, is_current=True).all()
+        assert [c.ip for c in current] == ["192.168.50.1"]

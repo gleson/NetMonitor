@@ -426,6 +426,99 @@ def _run_with_context(app: Flask, func, *args, **kwargs):
 # Job: Host Discovery
 # ---------------------------------------------------------------------------
 
+def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
+    """Atualiza os DeviceIp de um device visto em ``ip`` (descoberta ativa/passiva).
+
+    Comportamento padrão (device com um único IP): mantém exatamente um
+    DeviceIp com ``is_current=True``; quando o IP muda, rebaixa o anterior e
+    emite alerta NEW_IP_FOR_MAC (WARNING).
+
+    Device com ``is_multi_ip=True`` (ex.: roteador/gateway com o mesmo MAC em
+    várias redes): todos os IPs conhecidos permanecem ``is_current=True``
+    simultaneamente e ser visto em qualquer um deles NÃO gera alerta de troca
+    de IP — só um INFO na primeira vez que um IP inédito aparece.
+
+    ``via`` é um sufixo para a mensagem do alerta (ex.: " (descoberta passiva)").
+    """
+    from app.extensions import db
+    from app.models import DeviceIp, Alert, AlertType, Severity
+
+    if device.is_multi_ip:
+        known = DeviceIp.query.filter_by(device_id=device.id, ip=ip).first()
+        if known:
+            known.last_seen_at = now
+            # Reativa IPs rebaixados antes de o device ser marcado como multi-IP.
+            known.is_current = True
+            return
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip,
+            first_seen_at=now, last_seen_at=now, is_current=True,
+        ))
+        alert = Alert(
+            profile_id=profile.id,
+            device_id=device.id,
+            alert_type=AlertType.NEW_IP_FOR_MAC,
+            severity=Severity.INFO,
+            message=(
+                f"Novo IP adicional para device multi-IP {device.display_name} "
+                f"({device.mac}){via}: {ip}"
+            ),
+        )
+        db.session.add(alert)
+        _maybe_notify(alert, profile, device)
+        logger.info("IP adicional para device multi-IP %s: %s", device.mac, ip)
+        return
+
+    # Device de IP único — no máximo um DeviceIp atual. Usa .all() para também
+    # rebaixar sobras de um período em que o device foi multi-IP.
+    current_rows = (
+        DeviceIp.query.filter_by(device_id=device.id, is_current=True)
+        .order_by(DeviceIp.last_seen_at.desc())
+        .all()
+    )
+    match = next((r for r in current_rows if r.ip == ip), None)
+
+    if match is not None:
+        # Mesmo IP, atualiza last_seen; rebaixa quaisquer outros atuais.
+        match.last_seen_at = now
+        for row in current_rows:
+            if row is not match:
+                row.is_current = False
+        return
+
+    if not current_rows:
+        # Primeiro IP registrado
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip,
+            first_seen_at=now, last_seen_at=now, is_current=True,
+        ))
+        return
+
+    # IP mudou
+    previous = current_rows[0]
+    for row in current_rows:
+        row.is_current = False
+        row.last_seen_at = now
+
+    db.session.add(DeviceIp(
+        device_id=device.id, ip=ip,
+        first_seen_at=now, last_seen_at=now, is_current=True,
+    ))
+    alert = Alert(
+        profile_id=profile.id,
+        device_id=device.id,
+        alert_type=AlertType.NEW_IP_FOR_MAC,
+        severity=Severity.WARNING,
+        message=(
+            f"Device {device.display_name} ({device.mac}) mudou de "
+            f"IP{via}: {previous.ip} -> {ip}"
+        ),
+    )
+    db.session.add(alert)
+    _maybe_notify(alert, profile, device)
+    logger.info("IP mudou para device %s: %s -> %s", device.mac, previous.ip, ip)
+
+
 def run_host_discovery(profile_id: int):
     """Executa a descoberta de hosts para um perfil.
 
@@ -658,42 +751,9 @@ def run_host_discovery(profile_id: int):
                             host.ip, mac, conflict_mac, spoof_suspect,
                         )
 
-                # Gerencia DeviceIp
-                current_ip = DeviceIp.query.filter_by(
-                    device_id=device.id, is_current=True
-                ).first()
-
-                if current_ip is None:
-                    # Primeiro IP registrado
-                    new_dip = DeviceIp(
-                        device_id=device.id, ip=host.ip,
-                        first_seen_at=now, last_seen_at=now, is_current=True,
-                    )
-                    db.session.add(new_dip)
-                elif current_ip.ip != host.ip:
-                    # IP mudou
-                    current_ip.is_current = False
-                    current_ip.last_seen_at = now
-
-                    new_dip = DeviceIp(
-                        device_id=device.id, ip=host.ip,
-                        first_seen_at=now, last_seen_at=now, is_current=True,
-                    )
-                    db.session.add(new_dip)
-
-                    alert = Alert(
-                        profile_id=profile.id,
-                        device_id=device.id,
-                        alert_type=AlertType.NEW_IP_FOR_MAC,
-                        severity=Severity.WARNING,
-                        message=f"Device {device.display_name} ({mac}) mudou de IP: {current_ip.ip} -> {host.ip}",
-                    )
-                    db.session.add(alert)
-                    _maybe_notify(alert, profile, device)
-                    logger.info("IP mudou para device %s: %s -> %s", mac, current_ip.ip, host.ip)
-                else:
-                    # Mesmo IP, atualiza last_seen
-                    current_ip.last_seen_at = now
+                # Gerencia DeviceIp (multi-IP ciente: roteadores/gateways com o
+                # mesmo MAC em várias redes mantêm todos os IPs como atuais).
+                _upsert_device_ip(profile, device, host.ip, now)
 
             db.session.commit()
 
@@ -907,7 +967,11 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
                 Device.last_port_scanned_at < scan_cooldown,
             ),
         )
-        .order_by(Device.last_port_scanned_at.asc().nullsfirst())
+        .order_by(
+            Device.last_port_scanned_at.asc().nullsfirst(),
+            # Devices multi-IP: prioriza o DeviceIp visto mais recentemente.
+            DeviceIp.last_seen_at.desc(),
+        )
         .all()
     )
 
@@ -927,11 +991,17 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
 
     tasks = []
     skipped_passive = 0
+    queued_ids: set[int] = set()
     for device, device_ip in devices_with_ip:
+        # Devices multi-IP aparecem uma vez por IP atual — escaneia só um IP
+        # (o mais recente, pela ordenação acima) por rodada.
+        if device.id in queued_ids:
+            continue
         # Smart polling: devices em faixas passive_only não recebem port scan.
         if _ip_is_passive_only(device_ip.ip, passive_nets):
             skipped_passive += 1
             continue
+        queued_ids.add(device.id)
         tasks.append({
             "device_id": device.id,
             "device_display": device.display_name,
@@ -947,16 +1017,17 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
     return tasks
 
 
-def _next_alternate_nmap_args(device_id: int) -> str:
-    """Sequência de tipos de scan a tentar para um device suspeito.
+def _alternate_scan_sequence() -> list[str]:
+    """Sequência de argumentos nmap alternativos para reencontrar portas.
 
-    Cada chamada avança para o próximo tipo na sequência. Quando esgota,
-    reseta e o ciclo recomeça.
+    Usada quando um scan retorna 0 portas em um host comprovadamente online —
+    firewalls que dropam o tipo de probe original (ex.: SYN) muitas vezes
+    respondem a outro (ex.: connect), ou a um timing mais paciente.
 
     Mantemos --host-timeout para não travar o scheduler.
     """
     import os
-    sequence = [
+    return [
         # Connect scan + Pn — útil quando o roteador filtra SYN.
         "-Pn -sT -sV -T4 --version-intensity 2 --host-timeout 300s",
         # SYN + tentativa mais lenta com retries — root only; sem root cai p/ sT.
@@ -970,6 +1041,15 @@ def _next_alternate_nmap_args(device_id: int) -> str:
         # alertas espúrios [open → unfiltered] em vez de reencontrar as portas.
         "-Pn -sT -T2 --max-retries 2 --host-timeout 400s",
     ]
+
+
+def _next_alternate_nmap_args(device_id: int) -> str:
+    """Próximo tipo de scan alternativo a tentar para um device suspeito.
+
+    Cada chamada avança para o próximo tipo na sequência. Quando esgota,
+    reseta e o ciclo recomeça.
+    """
+    sequence = _alternate_scan_sequence()
     with _port_scan_retry_lock:
         idx = _port_scan_retry_args.get(device_id, -1)
         idx = (idx + 1) % len(sequence)
@@ -1172,7 +1252,10 @@ def run_port_scan(profile_id: int):
             # como fechadas (e re-alertaria na volta). Verificando alcançabilidade
             # primeiro, hosts que ficaram offline retornam host_found=False e o
             # processamento abaixo preserva as portas e re-enfileira o device.
-            is_up, _ = is_host_reachable(task["ip"])
+            # deep=True: host firewalled (ICMP dropado + portas comuns filtradas,
+            # sem ARP em sub-rede roteada) ainda é detectado via RST em portas
+            # da lista ampla — sem isso ele nunca seria escaneado.
+            is_up, _ = is_host_reachable(task["ip"], deep=True)
             if not is_up:
                 return task, [], False
             # Se este device foi marcado para retry com scan alternativo, usa.
@@ -1551,8 +1634,19 @@ def _online_devices_with_ip(profile_id: int, exclude_passive: bool = True):
             DeviceIp.is_current.is_(True),
             Device.last_seen_at >= cutoff,
         )
+        .order_by(DeviceIp.last_seen_at.desc())
         .all()
     )
+    # Devices multi-IP têm vários DeviceIp atuais — mantém só o mais recente
+    # para não escanear o mesmo host duas vezes na mesma rodada.
+    seen_ids: set[int] = set()
+    deduped = []
+    for d, dip in rows:
+        if d.id in seen_ids:
+            continue
+        seen_ids.add(d.id)
+        deduped.append((d, dip))
+    rows = deduped
     if not exclude_passive:
         return rows
 
@@ -1956,7 +2050,12 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
     if not device:
         return {"error": "Dispositivo não encontrado."}
 
-    current_dip = DeviceIp.query.filter_by(device_id=device.id, is_current=True).first()
+    # Devices multi-IP têm vários DeviceIp atuais — escaneia o mais recente.
+    current_dip = (
+        DeviceIp.query.filter_by(device_id=device.id, is_current=True)
+        .order_by(DeviceIp.last_seen_at.desc())
+        .first()
+    )
     if not current_dip:
         return {"error": "Dispositivo sem IP atual registrado."}
 
@@ -1996,18 +2095,23 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
         # Confirma liveness ANTES de escanear. O port scan usa -Pn, então o nmap
         # reportaria o host como up mesmo offline e fecharia as portas que
         # estavam abertas. Reaproveita o resultado do ping desta mesma execução
-        # quando disponível para não pingar duas vezes.
+        # quando disponível para não pingar duas vezes — mas um ping negativo
+        # NÃO basta para declarar offline: hosts firewalled dropam ICMP e
+        # filtram as portas comuns, então confirmamos com o probe profundo
+        # (deep=True), que detecta RST em portas fora das regras de firewall.
+        host_is_up = False
         if "ping" in scan_types and isinstance(results.get("ping"), dict):
             host_is_up = bool(results["ping"].get("is_up"))
-        else:
-            host_is_up, _ = is_host_reachable(ip)
+        if not host_is_up:
+            host_is_up, _ = is_host_reachable(ip, deep=True)
 
         if not host_is_up:
             # Host offline: não escaneia nem altera portas — preserva o baseline.
             # O scan_record é finalizado no fim da função (hosts_found=0).
             results["ports"] = []
             results["ports_skipped"] = (
-                "Host offline — scan de portas ignorado. As portas abertas "
+                "Host offline — scan de portas ignorado (sem resposta a ICMP, "
+                "ARP e TCP, inclusive no probe profundo). As portas abertas "
                 "registradas foram preservadas."
             )
             scan_record.result_summary = "Host offline — port scan ignorado."
@@ -2022,6 +2126,33 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
         ports_str = _get_ports_for_ip(ip, enabled_ranges, _profile_default_ports)
         port_results, host_found = scan_ports_for_host(ip, ports=ports_str)
         found_ports = get_actionable_ports(port_results)
+
+        # 0 portas em um host comprovadamente online? Tenta os tipos de scan
+        # alternativos (connect scan, timing mais paciente) antes de aceitar o
+        # zero — firewalls que dropam o tipo de probe original costumam
+        # responder a outro. Para no primeiro que encontrar algo.
+        if host_found and not found_ports:
+            alternates = _alternate_scan_sequence()
+            for attempt, alt_args in enumerate(alternates, start=1):
+                alt_results, alt_found = scan_ports_for_host(
+                    ip, ports=ports_str, arguments=alt_args,
+                )
+                alt_ports = get_actionable_ports(alt_results)
+                if alt_found and alt_ports:
+                    port_results, host_found = alt_results, alt_found
+                    found_ports = alt_ports
+                    results["ports_note"] = (
+                        f"O scan padrão retornou 0 portas; portas encontradas "
+                        f"na tentativa alternativa {attempt}/{len(alternates)} "
+                        f"({alt_args.split(' --host-timeout')[0]})."
+                    )
+                    break
+            else:
+                results["ports_note"] = (
+                    f"0 portas mesmo após {len(alternates)} scans alternativos "
+                    "(connect/timing paciente) — o host está online, mas nenhuma "
+                    "das portas verificadas respondeu."
+                )
 
         results["ports"] = [
             {
@@ -2237,6 +2368,8 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
         scan_record.result_summary = _build_mobile_result_message(mobile_res)
     else:
         scan_record.hosts_found = len(results.get("ports", [])) if "ports" in results else 0
+        if results.get("ports_note") and not scan_record.result_summary:
+            scan_record.result_summary = results["ports_note"]
 
     scan_record.status = ScanStatus.SUCCESS
     scan_record.finished_at = _utcnow()
@@ -2542,18 +2675,34 @@ def quick_host_down_check(profile_id: int):
         if not devices:
             return
 
-        created = 0
+        # Agrupa por device: um device multi-IP tem vários DeviceIp atuais e é
+        # considerado online se QUALQUER um deles responder. Sem o agrupamento,
+        # cada IP incrementaria o contador de falhas do mesmo device na mesma
+        # rodada, quebrando a confirmação em duas verificações consecutivas.
+        grouped: dict[int, tuple] = {}
         for device, dip in devices:
-            ip = dip.ip
-            is_up, _method = is_host_reachable(ip)
+            grouped.setdefault(device.id, (device, []))[1].append(dip)
+
+        created = 0
+        for device, dips in grouped.values():
+            # deep=True: host firewalled (ICMP dropado + portas comuns filtradas)
+            # ainda prova vida via RST em portas fora das regras — evita falso
+            # HOST_DOWN para ativos protegidos por firewall.
+            up_dip = None
+            for dip in dips:
+                is_up, _method = is_host_reachable(dip.ip, deep=True)
+                if is_up:
+                    up_dip = dip
+                    break
+            ip = ", ".join(d.ip for d in dips)
             now = _utcnow()
 
-            if is_up:
+            if up_dip is not None:
                 # Host respondeu — limpa contador e fecha alertas abertos
                 with _quick_host_down_lock:
                     _quick_host_down_failures.pop(device.id, None)
                 device.last_seen_at = now
-                dip.last_seen_at = now
+                up_dip.last_seen_at = now
                 device.record_online_today(now.date())
                 _ack_open_host_down_alerts(device.id, now)
                 continue

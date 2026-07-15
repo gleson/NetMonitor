@@ -230,6 +230,7 @@ def _ingest_observations(observations: list[tuple[str, str]]):
     from app.scanner.hosts import normalize_mac, is_valid_mac, get_vendor_from_mac
     from app.scanner.scheduling import (
         prepend_to_port_scan_queue, _ack_open_host_down_alerts, _maybe_notify,
+        _upsert_device_ip,
     )
 
     index = _build_profile_range_index()
@@ -300,30 +301,9 @@ def _ingest_observations(observations: list[tuple[str, str]]):
         device.record_online_today(now.date())
         _ack_open_host_down_alerts(device.id, now)
 
-        current_ip = DeviceIp.query.filter_by(device_id=device.id, is_current=True).first()
-        if current_ip is None:
-            db.session.add(DeviceIp(
-                device_id=device.id, ip=ip,
-                first_seen_at=now, last_seen_at=now, is_current=True,
-            ))
-        elif current_ip.ip != ip:
-            current_ip.is_current = False
-            current_ip.last_seen_at = now
-            db.session.add(DeviceIp(
-                device_id=device.id, ip=ip,
-                first_seen_at=now, last_seen_at=now, is_current=True,
-            ))
-            alert = Alert(
-                profile_id=profile.id,
-                device_id=device.id,
-                alert_type=AlertType.NEW_IP_FOR_MAC,
-                severity=Severity.WARNING,
-                message=f"Device {device.display_name} ({mac}) mudou de IP (descoberta passiva): {current_ip.ip} -> {ip}",
-            )
-            db.session.add(alert)
-            _maybe_notify(alert, profile, device)
-        else:
-            current_ip.last_seen_at = now
+        # Multi-IP ciente: roteadores/gateways com o mesmo MAC em várias redes
+        # mantêm todos os IPs atuais sem alerta de troca.
+        _upsert_device_ip(profile, device, ip, now, via=" (descoberta passiva)")
 
         db.session.commit()
 
