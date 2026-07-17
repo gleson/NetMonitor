@@ -144,6 +144,15 @@ class User(UserMixin, db.Model):
     role = db.Column(db.String(20), nullable=False, default=ROLE_VIEWER)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
+    # --- 2FA (TOTP / Google Authenticator) ---
+    # totp_secret guarda o segredo base32 cifrado com Fernet (mesmo esquema das
+    # communities SNMP). totp_enabled só vira True depois que o usuário confirma
+    # um código válido no enrollment. totp_backup_codes é um JSON com hashes
+    # (werkzeug) de códigos de recuperação de uso único.
+    totp_secret = db.Column(db.String(255), nullable=True)
+    totp_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    totp_backup_codes = db.Column(db.Text, nullable=True)
+
     def set_password(self, password: str):
         """Valida política e grava o hash. Use `User.validate_password` antes
         quando precisar coletar o erro sem explodir com ValueError.
@@ -176,6 +185,66 @@ class User(UserMixin, db.Model):
         Hierarquia: viewer < operator < admin.
         """
         return _ROLE_RANK.get(self.role, 0) >= _ROLE_RANK.get(required, 99)
+
+    # --- 2FA / TOTP ---
+
+    def set_totp_secret(self, secret: str) -> None:
+        """Cifra e grava o segredo TOTP (base32). Não ativa o 2FA por si só."""
+        self.totp_secret = _encrypt_str(secret) if secret else None
+
+    def get_totp_secret(self) -> str | None:
+        """Decifra e retorna o segredo TOTP em base32, ou None."""
+        if not self.totp_secret:
+            return None
+        return _decrypt_str(self.totp_secret)
+
+    def provisioning_uri(self, issuer: str = "NetMonitor") -> str | None:
+        """URI otpauth:// para o QR code do app autenticador."""
+        secret = self.get_totp_secret()
+        if not secret:
+            return None
+        import pyotp
+        return pyotp.TOTP(secret).provisioning_uri(name=self.username, issuer_name=issuer)
+
+    def verify_totp(self, code: str, valid_window: int = 1) -> bool:
+        """Valida um código TOTP de 6 dígitos (±1 janela p/ relógio dessincronizado)."""
+        secret = self.get_totp_secret()
+        if not secret or not code:
+            return False
+        import pyotp
+        return pyotp.TOTP(secret).verify(code.strip().replace(" ", ""), valid_window=valid_window)
+
+    def generate_backup_codes(self, count: int = 10) -> list[str]:
+        """Gera novos códigos de recuperação, grava seus hashes e retorna os
+        códigos em texto puro (mostrados ao usuário uma única vez)."""
+        import secrets
+        codes = [f"{secrets.randbelow(10**8):08d}" for _ in range(count)]
+        self.totp_backup_codes = json.dumps([generate_password_hash(c) for c in codes])
+        return codes
+
+    def verify_and_consume_backup(self, code: str) -> bool:
+        """Valida um código de recuperação; se casar, consome-o (uso único)."""
+        if not self.totp_backup_codes or not code:
+            return False
+        code = code.strip().replace(" ", "").replace("-", "")
+        try:
+            hashes = json.loads(self.totp_backup_codes)
+        except (ValueError, TypeError):
+            return False
+        for h in hashes:
+            if check_password_hash(h, code):
+                hashes.remove(h)
+                self.totp_backup_codes = json.dumps(hashes)
+                return True
+        return False
+
+    def backup_codes_remaining(self) -> int:
+        if not self.totp_backup_codes:
+            return 0
+        try:
+            return len(json.loads(self.totp_backup_codes))
+        except (ValueError, TypeError):
+            return 0
 
     def __repr__(self):
         return f"<User {self.username} role={self.role}>"

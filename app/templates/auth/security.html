@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Segurança da conta - NetMonitor{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-4">
+    <div class="col-md-7">
+        <h3 class="mb-4"><i class="bi bi-shield-lock"></i> Segurança da conta</h3>
+
+        <div class="card bg-dark border-secondary mb-4">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h5 class="card-title mb-1">
+                            Autenticação em duas etapas (2FA)
+                        </h5>
+                        <p class="text-muted small mb-0">
+                            Protege o login com um código temporário do
+                            Google Authenticator (ou compatível).
+                        </p>
+                    </div>
+                    <div>
+                        {% if current_user.totp_enabled %}
+                        <span class="badge bg-success fs-6">
+                            <i class="bi bi-check-circle"></i> Ativo
+                        </span>
+                        {% else %}
+                        <span class="badge bg-secondary fs-6">
+                            <i class="bi bi-x-circle"></i> Inativo
+                        </span>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <hr class="border-secondary">
+
+                {% if not current_user.totp_enabled %}
+                <a href="{{ url_for('auth.totp_setup') }}" class="btn btn-primary">
+                    <i class="bi bi-plus-circle"></i> Ativar 2FA
+                </a>
+                {% else %}
+                <p class="small mb-3">
+                    Códigos de backup restantes:
+                    <strong class="{% if backup_remaining <= 2 %}text-warning{% endif %}">
+                        {{ backup_remaining }}
+                    </strong>
+                </p>
+
+                <form method="POST" action="{{ url_for('auth.totp_regenerate_backup') }}"
+                      class="row g-2 align-items-end mb-3">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <div class="col-auto">
+                        <label class="form-label small mb-1">Código do app</label>
+                        <input type="text" class="form-control" name="code"
+                               inputmode="numeric" placeholder="000000" required>
+                    </div>
+                    <div class="col-auto">
+                        <button type="submit" class="btn btn-outline-warning">
+                            <i class="bi bi-arrow-repeat"></i> Gerar novos códigos de backup
+                        </button>
+                    </div>
+                </form>
+
+                <form method="POST" action="{{ url_for('auth.totp_disable') }}"
+                      class="row g-2 align-items-end"
+                      onsubmit="return confirm('Desativar o 2FA desta conta?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <div class="col-auto">
+                        <label class="form-label small mb-1">Código do app (ou backup)</label>
+                        <input type="text" class="form-control" name="code"
+                               inputmode="numeric" placeholder="000000" required>
+                    </div>
+                    <div class="col-auto">
+                        <button type="submit" class="btn btn-outline-danger">
+                            <i class="bi bi-shield-x"></i> Desativar 2FA
+                        </button>
+                    </div>
+                </form>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
