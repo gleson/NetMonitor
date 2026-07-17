@@ -226,10 +226,10 @@ def _match_profile(ip_str: str, index):
 def _ingest_observations(observations: list[tuple[str, str]]):
     """Cria/atualiza devices a partir de observações ARP (ip, mac)."""
     from app.extensions import db
-    from app.models import Device, DeviceIp, Alert, AlertType, Severity
+    from app.models import Device, DeviceIp, AlertType, Severity
     from app.scanner.hosts import normalize_mac, is_valid_mac, get_vendor_from_mac
     from app.scanner.scheduling import (
-        prepend_to_port_scan_queue, _ack_open_host_down_alerts, _maybe_notify,
+        prepend_to_port_scan_queue, _ack_open_host_down_alerts, emit_alert,
         _upsert_device_ip,
     )
 
@@ -274,15 +274,11 @@ def _ingest_observations(observations: list[tuple[str, str]]):
             db.session.add(device)
             db.session.flush()
 
-            new_dev_alert = Alert(
-                profile_id=profile.id,
-                device_id=device.id,
-                alert_type=AlertType.NEW_DEVICE,
-                severity=Severity.INFO,
-                message=f"Novo dispositivo (descoberta passiva): {mac} ({ip})",
+            emit_alert(
+                profile.id, device.id, AlertType.NEW_DEVICE, Severity.INFO,
+                f"Novo dispositivo (descoberta passiva): {mac} ({ip})",
+                match_value=mac, notify_profile=profile, notify_device=device,
             )
-            db.session.add(new_dev_alert)
-            _maybe_notify(new_dev_alert, profile, device)
             new_count += 1
             logger.info("Descoberta passiva: novo device %s (%s)", mac, ip)
 

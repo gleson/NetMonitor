@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Regras de supressão - NetMonitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2><i class="bi bi-bell-slash"></i> Regras de supressão de alertas</h2>
+    <a href="{{ url_for('alerts.alert_list') }}" class="btn btn-sm btn-outline-secondary">
+        <i class="bi bi-arrow-left"></i> Voltar aos alertas
+    </a>
+</div>
+
+<p class="text-muted">
+    Regras silenciam alertas repetitivos e esperados de um dispositivo. Casam por
+    <strong>tipo</strong> + escopo de <strong>dispositivo</strong> + <strong>valor</strong>
+    (prefixo). Ex.: ignorar a mudança de IP da impressora só dentro de uma sub-rede.
+    Criar ou remover uma regra exige reconfirmar sua identidade e fica registrado na
+    auditoria.
+</p>
+
+{% if not selected_profile_id %}
+<div class="alert alert-warning">Selecione um perfil ativo para gerenciar regras.</div>
+{% else %}
+
+<div class="card bg-dark border-secondary mb-4">
+    <div class="card-header"><i class="bi bi-plus-circle"></i> Nova regra</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('alerts.suppression_create') }}" class="row g-3">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <div class="col-md-4">
+                <label class="form-label" for="alert_type">Tipo de alerta</label>
+                <select class="form-select" id="alert_type" name="alert_type" required>
+                    <option value="">— selecione —</option>
+                    {% for t in alert_types %}
+                    <option value="{{ t.value }}" {% if prefill_type == t.value %}selected{% endif %}>{{ t.value }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="col-md-4">
+                <label class="form-label" for="device_id">Dispositivo</label>
+                <select class="form-select" id="device_id" name="device_id">
+                    <option value="">Qualquer dispositivo do perfil</option>
+                    {% for d in devices %}
+                    <option value="{{ d.id }}" {% if prefill_device_id == d.id %}selected{% endif %}>
+                        {{ d.display_name }}{% if d.current_ip %} ({{ d.current_ip }}){% endif %}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="col-md-4">
+                <label class="form-label" for="match_value">Valor (prefixo, opcional)</label>
+                <input type="text" class="form-control" id="match_value" name="match_value"
+                       value="{{ prefill_value }}" placeholder="ex.: 192.168.1.  ou  tcp/22">
+                <div class="form-text">
+                    Vazio = todos os alertas desse tipo no escopo. Casa por prefixo do
+                    valor (IP, <code>proto/porta</code>, MAC…).
+                </div>
+            </div>
+
+            <div class="col-md-8">
+                <label class="form-label" for="reason">Motivo (opcional)</label>
+                <input type="text" class="form-control" id="reason" name="reason"
+                       maxlength="500" placeholder="ex.: impressora troca de IP por DHCP, esperado">
+            </div>
+
+            <div class="col-md-4">
+                <label class="form-label" for="expires_in_days">Expira em (dias, opcional)</label>
+                <input type="number" min="1" class="form-control" id="expires_in_days"
+                       name="expires_in_days" placeholder="permanente">
+            </div>
+
+            <div class="col-12">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-shield-lock"></i> Criar regra
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<h5 class="mb-2">Regras existentes <span class="badge bg-secondary">{{ rules|length }}</span></h5>
+<div class="table-responsive">
+    <table class="table table-dark table-hover align-middle">
+        <thead>
+            <tr>
+                <th>Tipo</th>
+                <th>Dispositivo</th>
+                <th>Valor</th>
+                <th>Motivo</th>
+                <th>Criada por</th>
+                <th>Criada em</th>
+                <th>Expira</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in rules %}
+            <tr class="{% if not r.is_active(now) %}opacity-50{% endif %}">
+                <td><span class="badge bg-secondary">{{ r.alert_type.value }}</span></td>
+                <td>
+                    {% if r.device %}
+                        <a href="{{ url_for('devices.device_detail', device_id=r.device_id) }}" class="text-info text-decoration-none">{{ r.device.display_name }}</a>
+                    {% else %}
+                        <span class="text-muted">Qualquer</span>
+                    {% endif %}
+                </td>
+                <td>{% if r.match_value %}<code>{{ r.match_value }}</code>{% else %}<span class="text-muted">todos</span>{% endif %}</td>
+                <td class="small">{{ r.reason or '—' }}</td>
+                <td class="small">{{ r.created_by or '—' }}</td>
+                <td class="text-nowrap small">{{ r.created_at|localtime }}</td>
+                <td class="text-nowrap small">
+                    {% if r.expires_at %}
+                        {% if r.is_active(now) %}
+                            {{ r.expires_at|localtime }}
+                        {% else %}
+                            <span class="badge bg-dark border border-secondary">expirada</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="text-muted">nunca</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <form method="POST" action="{{ url_for('alerts.suppression_delete', rule_id=r.id) }}" class="d-inline"
+                          onsubmit="return confirm('Remover esta regra de supressão?')">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-sm btn-outline-danger" title="Remover regra">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </form>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="text-center text-muted">Nenhuma regra de supressão.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}

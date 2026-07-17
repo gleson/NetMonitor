@@ -662,6 +662,10 @@ class Alert(db.Model):
     # Alertas prioritários sobem ao topo e são renderizados em alert-danger.
     # Usado para HOST_DOWN confirmados (dupla checagem do quick_host_down_check).
     is_priority = db.Column(db.Boolean, default=False, nullable=False)
+    # Valor estruturado que caracteriza o alerta (IP novo, "tcp/22", MAC, etc.).
+    # Preenchido por emit_alert e usado para (a) casar regras de supressão e
+    # (b) pré-preencher o botão "Ignorar semelhantes". NULL = sem valor.
+    match_value = db.Column(db.String(255), nullable=True)
 
     @property
     def is_acknowledged(self) -> bool:
@@ -669,6 +673,67 @@ class Alert(db.Model):
 
     def __repr__(self):
         return f"<Alert {self.alert_type.value} severity={self.severity.value}>"
+
+
+class AlertSuppression(db.Model):
+    """Regra de supressão de alertas (anti-ruído), gerenciada por operadores.
+
+    Cada regra silencia alertas de um dado ``alert_type`` para um escopo:
+    - ``device_id`` NULL → qualquer dispositivo do perfil; senão só aquele device.
+    - ``match_value`` vazio/NULL → todos os alertas daquele tipo no escopo;
+      senão casa por **prefixo** do valor estruturado do alerta (ex.: valor
+      "192.168.1." ignora qualquer IP dessa sub-rede; "tcp/22" casa a porta
+      exata; "192.168.1.50" casa o IP exato).
+
+    A criação/remoção de regras é auditada e exige reconfirmação de identidade
+    (step-up/TOTP): um adversário poderia tentar silenciar alertas para ocultar
+    atividade, então o controle de supressão é ele próprio uma ação sensível.
+    """
+    __tablename__ = "alert_suppressions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    profile_id = db.Column(db.Integer, db.ForeignKey("profiles.id"), nullable=False, index=True)
+    device_id = db.Column(db.Integer, db.ForeignKey("devices.id"), nullable=True, index=True)
+    alert_type = db.Column(db.Enum(AlertType), nullable=False, index=True)
+    match_value = db.Column(db.String(255), nullable=True)
+    reason = db.Column(db.String(500), default="")
+    created_by = db.Column(db.String(80), default="")
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    # NULL = permanente; senão a regra deixa de valer após esta data (UTC naive).
+    expires_at = db.Column(db.DateTime, nullable=True)
+
+    device = db.relationship("Device", foreign_keys=[device_id])
+
+    def is_active(self, now=None) -> bool:
+        """True se a regra ainda vale (sem expiração ou expiração no futuro)."""
+        if self.expires_at is None:
+            return True
+        return self.expires_at > (now or _utcnow())
+
+    def matches(self, device_id, value, now=None) -> bool:
+        """True se esta regra (ativa) casa o escopo device+valor informado."""
+        if not self.is_active(now):
+            return False
+        if self.device_id is not None and self.device_id != device_id:
+            return False
+        prefix = (self.match_value or "").strip()
+        if prefix:
+            if value is None:
+                return False
+            return str(value).startswith(prefix)
+        return True
+
+    @classmethod
+    def is_suppressed(cls, profile_id, device_id, alert_type, value=None, now=None) -> bool:
+        """True se algum regra ativa do perfil silencia este alerta.
+
+        ``value`` é o valor estruturado do alerta (mesmo passado a emit_alert).
+        Consulta somente as regras do ``profile_id``/``alert_type`` e aplica
+        ``matches`` — a lógica de escopo device+prefixo fica em um só lugar.
+        """
+        now = now or _utcnow()
+        rules = cls.query.filter_by(profile_id=profile_id, alert_type=alert_type).all()
+        return any(r.matches(device_id, value, now) for r in rules)
 
 
 # ---------------------------------------------------------------------------

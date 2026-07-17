@@ -454,18 +454,14 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
             device_id=device.id, ip=ip,
             first_seen_at=now, last_seen_at=now, is_current=True,
         ))
-        alert = Alert(
-            profile_id=profile.id,
-            device_id=device.id,
-            alert_type=AlertType.NEW_IP_FOR_MAC,
-            severity=Severity.INFO,
-            message=(
+        emit_alert(
+            profile.id, device.id, AlertType.NEW_IP_FOR_MAC, Severity.INFO,
+            (
                 f"Novo IP adicional para device multi-IP {device.display_name} "
                 f"({device.mac}){via}: {ip}"
             ),
+            match_value=ip, notify_profile=profile, notify_device=device,
         )
-        db.session.add(alert)
-        _maybe_notify(alert, profile, device)
         logger.info("IP adicional para device multi-IP %s: %s", device.mac, ip)
         return
 
@@ -504,18 +500,14 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         device_id=device.id, ip=ip,
         first_seen_at=now, last_seen_at=now, is_current=True,
     ))
-    alert = Alert(
-        profile_id=profile.id,
-        device_id=device.id,
-        alert_type=AlertType.NEW_IP_FOR_MAC,
-        severity=Severity.WARNING,
-        message=(
+    emit_alert(
+        profile.id, device.id, AlertType.NEW_IP_FOR_MAC, Severity.WARNING,
+        (
             f"Device {device.display_name} ({device.mac}) mudou de "
             f"IP{via}: {previous.ip} -> {ip}"
         ),
+        match_value=ip, notify_profile=profile, notify_device=device,
     )
-    db.session.add(alert)
-    _maybe_notify(alert, profile, device)
     logger.info("IP mudou para device %s: %s -> %s", device.mac, previous.ip, ip)
 
 
@@ -627,15 +619,11 @@ def run_host_discovery(profile_id: int):
                     db.session.flush()  # Para obter device.id
 
                     # Alerta: novo dispositivo
-                    alert = Alert(
-                        profile_id=profile.id,
-                        device_id=device.id,
-                        alert_type=AlertType.NEW_DEVICE,
-                        severity=Severity.INFO,
-                        message=f"Novo dispositivo descoberto: {mac} ({host.ip}) - {host.hostname or 'sem hostname'}",
+                    emit_alert(
+                        profile.id, device.id, AlertType.NEW_DEVICE, Severity.INFO,
+                        f"Novo dispositivo descoberto: {mac} ({host.ip}) - {host.hostname or 'sem hostname'}",
+                        match_value=mac, notify_profile=profile, notify_device=device,
                     )
-                    db.session.add(alert)
-                    _maybe_notify(alert, profile, device)
                     logger.info("Novo device: %s (%s)", mac, host.ip)
 
                     # Insere no início da fila de port scan para ser escaneado logo
@@ -658,18 +646,16 @@ def run_host_discovery(profile_id: int):
                             alert_type=AlertType.UNAUTHORIZED_DEVICE,
                         ).filter(Alert.acknowledged_at.is_(None)).first()
                         if not already_open:
-                            unauth_alert = Alert(
-                                profile_id=profile.id,
-                                device_id=device.id,
-                                alert_type=AlertType.UNAUTHORIZED_DEVICE,
-                                severity=Severity.WARNING,
-                                message=(
+                            emit_alert(
+                                profile.id, device.id,
+                                AlertType.UNAUTHORIZED_DEVICE, Severity.WARNING,
+                                (
                                     f"Dispositivo não autorizado detectado na rede: "
                                     f"{device.display_name} ({mac}) em {host.ip}"
                                 ),
+                                match_value=mac,
+                                notify_profile=profile, notify_device=device,
                             )
-                            db.session.add(unauth_alert)
-                            _maybe_notify(unauth_alert, profile, device)
                             logger.warning(
                                 "Device não autorizado visto: %s (%s)", mac, host.ip
                             )
@@ -721,31 +707,28 @@ def run_host_discovery(profile_id: int):
                     ).first()
                     if not already_open:
                         if spoof_suspect:
-                            ip_alert = Alert(
-                                profile_id=profile.id,
-                                device_id=device.id,
-                                alert_type=AlertType.ARP_SPOOFING,
-                                severity=Severity.CRITICAL,
-                                is_priority=True,
-                                message=(
+                            emit_alert(
+                                profile.id, device.id, AlertType.ARP_SPOOFING,
+                                Severity.CRITICAL,
+                                (
                                     f"Possível ARP spoofing: {host.ip} respondido por {mac} "
                                     f"enquanto o dono recente {conflict_mac} "
                                     f"({conflict_dev.display_name}) ainda estava online"
                                 ),
+                                match_value=host.ip, is_priority=True,
+                                notify_profile=profile, notify_device=device,
                             )
                         else:
-                            ip_alert = Alert(
-                                profile_id=profile.id,
-                                device_id=device.id,
-                                alert_type=AlertType.IP_CONFLICT,
-                                severity=Severity.WARNING,
-                                message=(
+                            emit_alert(
+                                profile.id, device.id, AlertType.IP_CONFLICT,
+                                Severity.WARNING,
+                                (
                                     f"Conflito de IP: {host.ip} reivindicado por "
                                     f"{mac} e {conflict_mac} simultaneamente"
                                 ),
+                                match_value=host.ip,
+                                notify_profile=profile, notify_device=device,
                             )
-                        db.session.add(ip_alert)
-                        _maybe_notify(ip_alert, profile, device)
                         logger.warning(
                             "Conflito de IP %s entre %s e %s (spoofing=%s)",
                             host.ip, mac, conflict_mac, spoof_suspect,
@@ -895,17 +878,16 @@ def _check_ghost_devices(profile) -> int:
         ).first()
         if already_open:
             continue
-        ghost_alert = Alert(
-            profile_id=profile.id,
-            alert_type=AlertType.GHOST_DEVICE,
-            severity=Severity.WARNING,
-            message=(
+        ghost_alert = emit_alert(
+            profile.id, None, AlertType.GHOST_DEVICE, Severity.WARNING,
+            (
                 f"Dispositivo fantasma: {mac} visto na tabela ARP com IP {ip}, "
                 f"fora de todos os ranges configurados"
             ),
+            match_value=mac, notify_profile=profile,
         )
-        db.session.add(ghost_alert)
-        _maybe_notify(ghost_alert, profile, None)
+        if ghost_alert is None:
+            continue
         emitted += 1
         logger.warning("Device fantasma no ARP: %s (%s)", mac, ip)
 
@@ -1353,15 +1335,12 @@ def run_port_scan(profile_id: int):
                         and not port_authorized
                         and not _recent_port_alert_exists(device_id, proto, port_num)
                     ):
-                        new_port_alert = Alert(
-                            profile_id=profile.id,
-                            device_id=device_id,
-                            alert_type=AlertType.NEW_PORT,
-                            severity=_severity_for_port(port_num),
-                            message=f"Nova porta em {device_display} ({ip_str}): {proto}/{port_num} ({pi.service_name}) [{pi.state}]",
+                        emit_alert(
+                            profile.id, device_id, AlertType.NEW_PORT,
+                            _severity_for_port(port_num),
+                            f"Nova porta em {device_display} ({ip_str}): {proto}/{port_num} ({pi.service_name}) [{pi.state}]",
+                            match_value=f"{proto}/{port_num}", notify_profile=profile,
                         )
-                        db.session.add(new_port_alert)
-                        _maybe_notify(new_port_alert, profile, None)
 
                 # --- Detecção de "bug de portas sumidas" ---
                 # Se o device tinha >=2 portas mapeadas e o scan retornou 0,
@@ -1436,19 +1415,16 @@ def run_port_scan(profile_id: int):
                             and not p.is_authorized
                             and not _recent_port_alert_exists(device_id, proto, port_num)
                         ):
-                            state_alert = Alert(
-                                profile_id=profile.id,
-                                device_id=device_id,
-                                alert_type=AlertType.NEW_PORT,
-                                severity=_severity_for_port(port_num),
-                                message=(
+                            emit_alert(
+                                profile.id, device_id, AlertType.NEW_PORT,
+                                _severity_for_port(port_num),
+                                (
                                     f"Mudança de estado em {device_display} ({ip_str}): "
                                     f"{proto}/{port_num} ({pi.service_name or '-'}) "
                                     f"[{prev_state} → {pi.state}]"
                                 ),
+                                match_value=f"{proto}/{port_num}", notify_profile=profile,
                             )
-                            db.session.add(state_alert)
-                            _maybe_notify(state_alert, profile, None)
                         p.state = pi.state
                         if pi.service_version:
                             p.service_version = pi.service_version
@@ -1615,19 +1591,15 @@ def _record_detected_open_port(
     if _recent_port_alert_exists(device_id, pi.protocol, pi.port):
         return False
 
-    alert = Alert(
-        profile_id=profile.id,
-        device_id=device_id,
-        alert_type=AlertType.NEW_PORT,
-        severity=_severity_for_port(pi.port),
-        message=(
+    alert = emit_alert(
+        profile.id, device_id, AlertType.NEW_PORT, _severity_for_port(pi.port),
+        (
             f"Nova porta em {device_display} ({ip_str}): "
             f"{pi.protocol}/{pi.port} ({pi.service_name}) [{pi.state}] — via {source}"
         ),
+        match_value=f"{pi.protocol}/{pi.port}", notify_profile=profile,
     )
-    db.session.add(alert)
-    _maybe_notify(alert, profile, None)
-    return True
+    return alert is not None
 
 
 def _online_devices_with_ip(profile_id: int, exclude_passive: bool = True):
@@ -1971,21 +1943,17 @@ def check_tls_certificates():
             status_txt = f"expira em {days_left} dia(s)"
 
         profile = db.session.get(Profile, device.profile_id)
-        alert = Alert(
-            profile_id=device.profile_id,
-            device_id=device.id,
-            alert_type=AlertType.TLS_CERT_EXPIRING,
-            severity=severity,
-            message=(
+        alert = emit_alert(
+            device.profile_id, device.id, AlertType.TLS_CERT_EXPIRING, severity,
+            (
                 f"Certificado TLS em {device.display_name} ({ip}:{port_row.port}) "
                 f"{status_txt} (validade até {not_after:%d/%m/%Y})"
                 + (f" — {subject}" if subject else "")
             ),
+            match_value=f"tcp/{port_row.port}", notify_profile=profile, notify_device=device,
         )
-        db.session.add(alert)
-        if profile:
-            _maybe_notify(alert, profile, device)
-        alerts += 1
+        if alert is not None:
+            alerts += 1
 
     db.session.commit()
     logger.info("Verificação TLS: %d certificado(s) lidos, %d alerta(s).", checked, alerts)
@@ -2208,11 +2176,12 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
                 ))
             # Só alerta para portas OPEN (filtered não oferece risco).
             if pi.state == "open":
-                db.session.add(Alert(
-                    profile_id=device.profile_id, device_id=device.id,
-                    alert_type=AlertType.NEW_PORT, severity=_severity_for_port(port_num),
-                    message=f"Nova porta em {device.display_name}: {proto}/{port_num} ({pi.service_name}) [{pi.state}]",
-                ))
+                emit_alert(
+                    device.profile_id, device.id, AlertType.NEW_PORT,
+                    _severity_for_port(port_num),
+                    f"Nova porta em {device.display_name}: {proto}/{port_num} ({pi.service_name}) [{pi.state}]",
+                    match_value=f"{proto}/{port_num}",
+                )
 
         if host_found:
             for key in (old_set - found_set):
@@ -2230,15 +2199,16 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
                 # Gera alerta quando o estado muda (ex.: filtered → open).
                 prev_state = p.state
                 if prev_state and pi.state and prev_state != pi.state:
-                    db.session.add(Alert(
-                        profile_id=device.profile_id, device_id=device.id,
-                        alert_type=AlertType.NEW_PORT, severity=_severity_for_port(port_num),
-                        message=(
+                    emit_alert(
+                        device.profile_id, device.id, AlertType.NEW_PORT,
+                        _severity_for_port(port_num),
+                        (
                             f"Mudança de estado em {device.display_name}: "
                             f"{proto}/{port_num} ({pi.service_name or '-'}) "
                             f"[{prev_state} → {pi.state}]"
                         ),
-                    ))
+                        match_value=f"{proto}/{port_num}",
+                    )
                 p.state = pi.state
                 if pi.service_name:
                     p.service_name = pi.service_name
@@ -2309,23 +2279,21 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
             # o card "Vulnerabilidades Abertas" do dashboard conta estas linhas
             # e cada uma deve ter alerta correspondente.
             if newly_vulnerable:
+                vuln_proto = v.get("protocol", "tcp") or "tcp"
                 port_txt = (
-                    f" na porta {v.get('protocol', 'tcp') or 'tcp'}/{v['port']}"
-                    if v.get("port") else ""
+                    f" na porta {vuln_proto}/{v['port']}" if v.get("port") else ""
                 )
-                vuln_alert = Alert(
-                    profile_id=device.profile_id,
-                    device_id=device.id,
-                    alert_type=AlertType.VULNERABILITY,
-                    severity=Severity.CRITICAL,
-                    message=(
+                vuln_value = f"{vuln_proto}/{v['port']}" if v.get("port") else v["script"]
+                emit_alert(
+                    device.profile_id, device.id, AlertType.VULNERABILITY,
+                    Severity.CRITICAL,
+                    (
                         f"Vulnerabilidade confirmada em {device.display_name} ({ip})"
                         f"{port_txt}: {v['script']}"
                     ),
+                    match_value=vuln_value,
+                    notify_profile=vuln_profile, notify_device=device,
                 )
-                db.session.add(vuln_alert)
-                if vuln_profile:
-                    _maybe_notify(vuln_alert, vuln_profile, device)
 
     # --- SNMP ---
     if "snmp" in scan_types:
@@ -2640,6 +2608,48 @@ def _maybe_notify(alert, profile, device) -> None:
         logger.exception("Falha ao preparar notificação para alert")
 
 
+def emit_alert(profile_id, device_id, alert_type, severity, message, *,
+               match_value=None, is_priority=False,
+               notify_profile=None, notify_device=None):
+    """Cria um ``Alert`` respeitando as regras de supressão (Feature 3).
+
+    Ponto único de emissão de alertas — os sites NÃO devem instanciar ``Alert``
+    diretamente — para que a supressão seja aplicada de forma uniforme e o
+    ``match_value`` estruturado fique gravado (usado pelo botão "Ignorar
+    semelhantes"). Centraliza:
+      - checagem de ``AlertSuppression.is_suppressed`` (profile+device+tipo+valor);
+      - ``db.session.add``;
+      - ``_maybe_notify`` quando ``notify_profile`` é informado.
+
+    Retorna o ``Alert`` criado, ou ``None`` se uma regra ativa silencia este
+    alerta. O ``match_value`` deve ser o valor estruturado que caracteriza o
+    alerta (IP novo, ``"tcp/22"``, MAC, ``"<proto>/<porta>"`` etc.).
+    """
+    from app.extensions import db
+    from app.models import Alert, AlertSuppression
+
+    if AlertSuppression.is_suppressed(profile_id, device_id, alert_type, match_value):
+        logger.info(
+            "Alerta %s suprimido por regra (device=%s, valor=%s)",
+            getattr(alert_type, "value", alert_type), device_id, match_value,
+        )
+        return None
+
+    alert = Alert(
+        profile_id=profile_id,
+        device_id=device_id,
+        alert_type=alert_type,
+        severity=severity,
+        message=message,
+        is_priority=is_priority,
+        match_value=match_value,
+    )
+    db.session.add(alert)
+    if notify_profile is not None:
+        _maybe_notify(alert, notify_profile, notify_device)
+    return alert
+
+
 # ---------------------------------------------------------------------------
 # Job: HOST_DOWN (detecta devices sumidos)
 # ---------------------------------------------------------------------------
@@ -2747,19 +2757,16 @@ def quick_host_down_check(profile_id: int):
             if open_alert:
                 continue
 
-            alert = Alert(
-                profile_id=profile_id,
-                device_id=device.id,
-                alert_type=AlertType.HOST_DOWN,
-                severity=Severity.CRITICAL,
-                is_priority=True,
-                message=(
+            alert = emit_alert(
+                profile_id, device.id, AlertType.HOST_DOWN, Severity.CRITICAL,
+                (
                     f"Host OFFLINE confirmado: {device.display_name} ({device.mac}) "
                     f"em {ip} — duas verificações consecutivas sem resposta."
                 ),
+                is_priority=True, notify_profile=profile, notify_device=device,
             )
-            db.session.add(alert)
-            _maybe_notify(alert, profile, device)
+            if alert is None:
+                continue
             created += 1
             logger.warning(
                 "Quick check: %s (%s) HOST_DOWN confirmado após 2 falhas.",

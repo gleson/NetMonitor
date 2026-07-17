@@ -338,9 +338,9 @@ def correlate_cves() -> dict:
 
     from app.extensions import db
     from app.models import (
-        Alert, AlertType, Device, Port, Profile, Severity, Vulnerability, _utcnow,
+        AlertType, Device, Port, Profile, Severity, Vulnerability, _utcnow,
     )
-    from app.scanner.scheduling import _maybe_notify
+    from app.scanner.scheduling import emit_alert
 
     if not current_app.config.get("CVE_LOOKUP_ENABLED", True):
         logger.info("Correlação CVE desabilitada (CVE_LOOKUP_ENABLED=0).")
@@ -448,23 +448,19 @@ def correlate_cves() -> dict:
             # gateways "Roteador" em redes diferentes).
             device_ip = device.current_ip or "sem IP"
             kev_prefix = "[CISA KEV — EXPLORAÇÃO ATIVA] " if is_kev else ""
-            alert = Alert(
-                profile_id=device.profile_id,
-                device_id=device.id,
-                alert_type=AlertType.VULNERABILITY,
-                severity=severity,
-                is_priority=is_kev,
-                message=(
+            alert = emit_alert(
+                device.profile_id, device.id, AlertType.VULNERABILITY, severity,
+                (
                     f"{kev_prefix}CVE conhecido em {device.display_name} ({device_ip}): "
                     f"{service_name} {version} "
                     f"na porta {port_row.protocol}/{port_row.port} — "
                     f"CVSS máx {max_cvss} ({cve_ids})"
                 ),
+                match_value=f"{port_row.protocol}/{port_row.port}",
+                is_priority=is_kev, notify_profile=profile, notify_device=device,
             )
-            db.session.add(alert)
-            if profile:
-                _maybe_notify(alert, profile, device)
-            stats["alerts"] += 1
+            if alert is not None:
+                stats["alerts"] += 1
 
         db.session.commit()
 

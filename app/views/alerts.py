@@ -1,13 +1,15 @@
 """Blueprint de alertas."""
 
-from flask import Blueprint, render_template, request, redirect, url_for, flash
-from flask_login import login_required
+from datetime import timedelta
 
-from app.auth_utils import audit, require_role
+from flask import Blueprint, render_template, request, redirect, url_for, flash
+from flask_login import login_required, current_user
+
+from app.auth_utils import audit, require_role, require_fresh_confirmation
 from app.extensions import db
 from app.models import (
-    Alert, AlertType, Severity, Device, DeviceIp, Profile, ROLE_OPERATOR,
-    _utcnow,
+    Alert, AlertSuppression, AlertType, Severity, Device, DeviceIp, Profile,
+    ROLE_OPERATOR, _utcnow,
 )
 
 alerts_bp = Blueprint("alerts", __name__, template_folder="../templates/alerts")
@@ -277,3 +279,143 @@ def acknowledge_all():
             "success",
         )
     return redirect(request.referrer or url_for("alerts.alert_list"))
+
+
+# ---------------------------------------------------------------------------
+# Supressão de alertas (Feature 3) — regras anti-ruído por device+tipo+valor.
+# Criar/remover exige reconfirmação de identidade (step-up/TOTP) e é auditado:
+# silenciar alertas é uma ação sensível (um adversário poderia usá-la para
+# ocultar atividade), por isso o mesmo controle das configs de segurança.
+# ---------------------------------------------------------------------------
+
+@alerts_bp.route("/suppressions")
+@login_required
+@require_role(ROLE_OPERATOR)
+def suppressions():
+    """Lista as regras de supressão do perfil ativo e o formulário de criação.
+
+    Aceita parâmetros de pré-preenchimento (``device_id``/``type``/``value``)
+    usados pelo botão "Ignorar semelhantes" da lista de alertas.
+    """
+    from app.profile_utils import get_active_profile_id
+    profile_id = get_active_profile_id()
+
+    rules = []
+    devices = []
+    if profile_id:
+        rules = (
+            AlertSuppression.query.filter_by(profile_id=profile_id)
+            .order_by(AlertSuppression.created_at.desc())
+            .all()
+        )
+        devices = (
+            Device.query.filter_by(profile_id=profile_id)
+            .order_by(Device.friendly_name, Device.hostname, Device.mac)
+            .all()
+        )
+
+    prefill_type = request.args.get("type", "")
+    try:
+        prefill_type = AlertType(prefill_type).value if prefill_type else ""
+    except ValueError:
+        prefill_type = ""
+
+    return render_template(
+        "alerts/suppressions.html",
+        rules=rules,
+        devices=devices,
+        alert_types=AlertType,
+        selected_profile_id=profile_id,
+        now=_utcnow(),
+        prefill_device_id=request.args.get("device_id", type=int),
+        prefill_type=prefill_type,
+        prefill_value=request.args.get("value", ""),
+    )
+
+
+@alerts_bp.route("/suppressions/create", methods=["POST"])
+@login_required
+@require_role(ROLE_OPERATOR)
+@require_fresh_confirmation
+def suppression_create():
+    """Cria uma regra de supressão (após reconfirmação de identidade)."""
+    from app.profile_utils import get_active_profile_id
+    profile_id = get_active_profile_id()
+    if not profile_id:
+        flash("Selecione um perfil antes de criar uma regra.", "danger")
+        return redirect(url_for("alerts.suppressions"))
+
+    raw_type = request.form.get("alert_type", "").strip()
+    try:
+        alert_type = AlertType(raw_type)
+    except ValueError:
+        flash("Tipo de alerta inválido.", "danger")
+        return redirect(url_for("alerts.suppressions"))
+
+    device_id = request.form.get("device_id", type=int)
+    if device_id:
+        device = db.session.get(Device, device_id)
+        if not device or device.profile_id != profile_id:
+            flash("Dispositivo inválido para o perfil ativo.", "danger")
+            return redirect(url_for("alerts.suppressions"))
+
+    match_value = (request.form.get("match_value", "") or "").strip() or None
+    reason = (request.form.get("reason", "") or "").strip()[:500]
+
+    expires_at = None
+    days = request.form.get("expires_in_days", type=int)
+    if days and days > 0:
+        expires_at = _utcnow() + timedelta(days=days)
+
+    rule = AlertSuppression(
+        profile_id=profile_id,
+        device_id=device_id or None,
+        alert_type=alert_type,
+        match_value=match_value,
+        reason=reason,
+        created_by=getattr(current_user, "username", "") or "",
+        expires_at=expires_at,
+    )
+    db.session.add(rule)
+    db.session.flush()
+    audit(
+        "alert.suppression_create",
+        "alert_suppression",
+        rule.id,
+        details=(
+            f"tipo={alert_type.value} device_id={device_id or '*'} "
+            f"valor={match_value or '*'} expira={expires_at or 'nunca'}"
+        ),
+    )
+    db.session.commit()
+    flash("Regra de supressão criada.", "success")
+    return redirect(url_for("alerts.suppressions"))
+
+
+@alerts_bp.route("/suppressions/<int:rule_id>/delete", methods=["POST"])
+@login_required
+@require_role(ROLE_OPERATOR)
+@require_fresh_confirmation
+def suppression_delete(rule_id):
+    """Remove uma regra de supressão (após reconfirmação de identidade)."""
+    from app.profile_utils import get_active_profile_id
+    profile_id = get_active_profile_id()
+
+    rule = db.session.get(AlertSuppression, rule_id)
+    if not rule or (profile_id and rule.profile_id != profile_id):
+        flash("Regra não encontrada.", "danger")
+        return redirect(url_for("alerts.suppressions"))
+
+    audit(
+        "alert.suppression_delete",
+        "alert_suppression",
+        rule.id,
+        details=(
+            f"tipo={rule.alert_type.value} device_id={rule.device_id or '*'} "
+            f"valor={rule.match_value or '*'}"
+        ),
+    )
+    db.session.delete(rule)
+    db.session.commit()
+    flash("Regra de supressão removida.", "success")
+    return redirect(url_for("alerts.suppressions"))
