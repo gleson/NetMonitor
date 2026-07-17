@@ -40,6 +40,7 @@ def create_app(config_name: str | None = None) -> Flask:
 
     # --- Extensões ---
     db.init_app(app)
+    _configure_sqlite_pragmas(app)
     migrate.init_app(app, db)
     login_manager.init_app(app)
     csrf.init_app(app)
@@ -107,6 +108,42 @@ def _ensure_sqlite_dir(app: Flask):
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
+
+
+def _configure_sqlite_pragmas(app: Flask):
+    """Ajusta pragmas por conexão SQLite: WAL + busy_timeout.
+
+    Os cinco jobs por perfil rodam em threads paralelas do APScheduler e
+    escrevem no mesmo arquivo. Sem isto:
+    - journal_mode=delete faz cada escrita travar o arquivo inteiro (leitores
+      e escritores se serializam), e
+    - o busy_timeout default (5s) é curto demais, então um job que espera o
+      lock de outro estoura "database is locked" e aborta a rodada.
+
+    WAL deixa leituras concorrerem com uma escrita; busy_timeout faz o SQLite
+    esperar em vez de falhar na hora. No-op para backends não-SQLite.
+    """
+    from sqlalchemy import event
+
+    uri = app.config.get("SQLALCHEMY_DATABASE_URI", "")
+    if not uri.startswith("sqlite:"):
+        return
+
+    is_memory = ":memory:" in uri
+    busy_ms = int(app.config.get("SQLITE_BUSY_TIMEOUT_SECONDS", 30)) * 1000
+    with app.app_context():
+        engine = db.engine
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        try:
+            # WAL é persistente e não faz sentido em :memory: (banco de teste).
+            if not is_memory:
+                cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute(f"PRAGMA busy_timeout={busy_ms}")
+        finally:
+            cursor.close()
 
 
 def _register_blueprints(app: Flask):

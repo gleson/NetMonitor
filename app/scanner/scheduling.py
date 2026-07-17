@@ -755,6 +755,11 @@ def run_host_discovery(profile_id: int):
                 # mesmo MAC em várias redes mantêm todos os IPs como atuais).
                 _upsert_device_ip(profile, device, host.ip, now)
 
+            # Commit por range (dentro do loop, de propósito): o ARP scan do
+            # próximo range leva ~8s e a transação de escrita precisa estar
+            # fechada antes dele — senão o lock do SQLite fica retido durante o
+            # scan e os outros jobs, que rodam em threads paralelas, batem em
+            # "database is locked".
             db.session.commit()
 
         # Marca resultado no banco
@@ -790,11 +795,24 @@ def run_host_discovery(profile_id: int):
             logger.exception("Erro na detecção de devices fantasma (profile %d)", profile_id)
 
     except Exception as e:
-        scan.status = ScanStatus.ERROR
-        scan.finished_at = _utcnow()
-        scan.error_message = str(e)
-        db.session.commit()
+        # Rollback antes de tocar na sessão: se o erro veio de um flush (ex.:
+        # "database is locked"), a transação já está morta e qualquer query ou
+        # commit aqui estoura PendingRollbackError, mascarando o erro original
+        # e — pior — deixando o Scan preso em RUNNING para sempre.
+        db.session.rollback()
         logger.exception("Erro no host discovery para profile %d", profile_id)
+        try:
+            scan_row = db.session.get(Scan, scan.id)
+            if scan_row:
+                scan_row.status = ScanStatus.ERROR
+                scan_row.finished_at = _utcnow()
+                scan_row.error_message = str(e)[:500]
+                db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception(
+                "Falha ao registrar o erro do scan %s no banco", scan.id
+            )
 
 
 # ---------------------------------------------------------------------------

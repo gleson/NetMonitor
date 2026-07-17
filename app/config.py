@@ -16,6 +16,13 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    # --- SQLite: espera por lock de escrita ---
+    # Os jobs do scheduler rodam em threads paralelas e escrevem no mesmo arquivo.
+    # O default do pysqlite (5s) é curto demais: um job que escreve enquanto outro
+    # segura o lock estoura "database is locked" e aborta a rodada. Ignorado em
+    # backends não-SQLite. Ver _configure_sqlite_pragmas em app/__init__.py.
+    SQLITE_BUSY_TIMEOUT_SECONDS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_SECONDS", 30))
+
     # --- Cookies de sessão ---
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
