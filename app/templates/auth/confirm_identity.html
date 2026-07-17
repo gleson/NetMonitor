@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Confirmar identidade - NetMonitor{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-4">
+        <div class="card bg-dark border-secondary">
+            <div class="card-body">
+                <h4 class="card-title text-center mb-3">
+                    <i class="bi bi-shield-exclamation"></i> Confirme sua identidade
+                </h4>
+                <p class="text-muted small text-center">
+                    Esta é uma ação sensível de segurança. Reconfirme para continuar.
+                </p>
+                <form method="POST" action="{{ url_for('auth.confirm_identity') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="next" value="{{ next_url }}">
+                    {% if uses_totp %}
+                    <div class="mb-3">
+                        <label for="code" class="form-label">Código do autenticador</label>
+                        <input type="text" class="form-control text-center fs-4" id="code"
+                               name="code" required autofocus autocomplete="one-time-code"
+                               inputmode="numeric" pattern="[0-9 ]*" maxlength="9"
+                               placeholder="000000">
+                        <div class="form-text">Ou use um código de backup.</div>
+                    </div>
+                    {% else %}
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Senha da conta</label>
+                        <input type="password" class="form-control" id="password"
+                               name="password" required autofocus
+                               autocomplete="current-password">
+                        <div class="form-text">
+                            Dica: ative o 2FA em Segurança para proteção mais forte.
+                        </div>
+                    </div>
+                    {% endif %}
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-unlock"></i> Confirmar
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -13,7 +13,7 @@ from flask import (
 )
 from flask_login import login_user, logout_user, login_required, current_user
 
-from app.auth_utils import audit
+from app.auth_utils import audit, mark_sudo_fresh, is_safe_redirect_url
 from app.extensions import db, limiter
 from app.models import User, AuditLog, _utcnow
 
@@ -286,6 +286,62 @@ def logout():
     db.session.commit()
     flash("Logout realizado.", "info")
     return redirect(url_for("auth.login"))
+
+
+# ---------------------------------------------------------------------------
+# Reconfirmação de identidade (sudo mode) para ações sensíveis
+# ---------------------------------------------------------------------------
+
+@auth_bp.route("/account/confirm", methods=["GET", "POST"])
+@login_required
+@limiter.limit("10 per minute; 30 per hour", methods=["POST"])
+def confirm_identity():
+    """Reconfirma a identidade do usuário já logado antes de uma ação sensível.
+
+    Usa o código do autenticador (TOTP/backup) se o 2FA estiver ativo; caso
+    contrário, a senha da conta. Em sucesso, marca a sessão como fresca por
+    ``SUDO_GRACE_MINUTES`` e volta para o destino original.
+    """
+    next_url = request.values.get("next", "")
+    if not is_safe_redirect_url(next_url):
+        next_url = url_for("main.dashboard")
+
+    uses_totp = current_user.totp_enabled
+
+    if request.method == "POST":
+        if uses_totp:
+            code = request.form.get("code", "")
+            ok = current_user.verify_totp(code) or current_user.verify_and_consume_backup(code)
+        else:
+            ok = current_user.check_password(request.form.get("password", ""))
+
+        if ok:
+            mark_sudo_fresh()
+            audit(
+                "sudo.confirmed",
+                entity_type="user",
+                entity_id=current_user.id,
+                details=f"Reconfirmação via {'TOTP' if uses_totp else 'senha'}",
+                username=current_user.username,
+                user_id=current_user.id,
+            )
+            db.session.commit()
+            return redirect(next_url)
+
+        audit(
+            "sudo.failed",
+            entity_type="user",
+            entity_id=current_user.id,
+            details=f"Reconfirmação falhou ({'TOTP' if uses_totp else 'senha'})",
+            username=current_user.username,
+            user_id=current_user.id,
+        )
+        db.session.commit()
+        flash("Confirmação inválida.", "danger")
+
+    return render_template(
+        "auth/confirm_identity.html", uses_totp=uses_totp, next_url=next_url,
+    )
 
 
 # ---------------------------------------------------------------------------

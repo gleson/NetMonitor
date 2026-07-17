@@ -5,7 +5,7 @@ import ipaddress
 from flask import Blueprint, render_template, request, redirect, url_for, flash
 from flask_login import login_required, current_user
 
-from app.auth_utils import audit, require_role
+from app.auth_utils import audit, require_role, require_fresh_confirmation
 from app.extensions import db
 from app.models import Profile, IpRange, User, AppSetting, ROLE_ADMIN
 
@@ -396,6 +396,7 @@ def user_list():
 @admin_bp.route("/users/new", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def user_new():
     """Cria novo usuário."""
     roles = ["viewer", "operator", "admin"]
@@ -435,6 +436,7 @@ def user_new():
 @admin_bp.route("/users/<int:user_id>/edit", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def user_edit(user_id):
     """Edita username e role de um usuário."""
     user = db.session.get(User, user_id) or _abort(404)
@@ -471,6 +473,7 @@ def user_edit(user_id):
 @admin_bp.route("/users/<int:user_id>/set-password", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def user_set_password(user_id):
     """Define nova senha para um usuário."""
     user = db.session.get(User, user_id) or _abort(404)
@@ -500,6 +503,7 @@ def user_set_password(user_id):
 @admin_bp.route("/users/<int:user_id>/toggle-active", methods=["POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def user_toggle_active(user_id):
     """Bloqueia ou desbloqueia uma conta de usuário."""
     user = db.session.get(User, user_id) or _abort(404)
@@ -521,6 +525,7 @@ def user_toggle_active(user_id):
 @admin_bp.route("/users/<int:user_id>/delete", methods=["POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def user_delete(user_id):
     """Remove um usuário do sistema."""
     user = db.session.get(User, user_id) or _abort(404)
@@ -549,6 +554,7 @@ TOPOLOGY_KEY = "topology_lldp_enabled"
 @admin_bp.route("/scan-settings", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def scan_settings():
     """Painel de ajustes globais de scan editáveis em runtime.
 
@@ -627,6 +633,7 @@ def scan_settings():
 @admin_bp.route("/metrics-settings", methods=["GET", "POST"])
 @login_required
 @require_role(ROLE_ADMIN)
+@require_fresh_confirmation
 def metrics_settings():
     """Habilita/desabilita o endpoint Prometheus, gerencia o token e mostra
     uma prévia das métricas atuais (por perfil) renderizada no sistema.

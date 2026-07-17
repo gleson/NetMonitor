@@ -49,6 +49,13 @@ class Config:
         os.environ.get("LOGIN_MAX_FAILED_ATTEMPTS_GLOBAL", 30)
     )
 
+    # --- Reconfirmação de identidade ("sudo mode") ---
+    # Ações sensíveis (gestão de usuários, ajustes de scan, token de métricas)
+    # exigem reconfirmar a identidade — código TOTP se o 2FA estiver ativo, ou
+    # a senha da conta. A confirmação vale por esta janela (minutos) para não
+    # pedir o código a cada clique dentro de um fluxo administrativo.
+    SUDO_GRACE_MINUTES = int(os.environ.get("SUDO_GRACE_MINUTES", 10))
+
     # --- Intervalos padrão de scan (em minutos) ---
     DEFAULT_HOST_DISCOVERY_INTERVAL = 45
     DEFAULT_PORT_SCAN_INTERVAL = 4

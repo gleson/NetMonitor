@@ -22,6 +22,11 @@ def _login_as(app, db, role):
     client = app.test_client()
     with client.session_transaction() as sess:
         sess["_user_id"] = str(user.id)
+        # Marca a sessão como reconfirmada (sudo mode): estes testes injetam o
+        # login direto na sessão e exercitam funcionalidades protegidas por
+        # require_fresh_confirmation. O fluxo de reconfirmação em si é coberto
+        # por tests/test_stepup.py.
+        sess["sudo_until"] = (_utcnow() + timedelta(hours=1)).isoformat()
     return client
 
 

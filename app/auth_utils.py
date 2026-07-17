@@ -1,12 +1,14 @@
-"""Helpers de autorização (RBAC) e registro de auditoria."""
+"""Helpers de autorização (RBAC), auditoria e reconfirmação de identidade."""
 
+from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import urlparse
 
-from flask import abort, flash, redirect, request, url_for
+from flask import abort, current_app, flash, redirect, request, session, url_for
 from flask_login import current_user
 
 from app.extensions import db
-from app.models import AuditLog, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER
+from app.models import AuditLog, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, _utcnow
 
 
 def require_role(min_role: str):
@@ -90,8 +92,90 @@ def audit(
     return log
 
 
+# ---------------------------------------------------------------------------
+# Reconfirmação de identidade ("sudo mode") para ações sensíveis
+# ---------------------------------------------------------------------------
+#
+# Certas mutações de configuração de segurança (gestão de usuários, ajustes de
+# scan, token de métricas) exigem que o usuário reprove a identidade mesmo já
+# logado — com o código do autenticador (TOTP) se o 2FA estiver ativo, ou a
+# senha da conta caso contrário. Isso limita o estrago de uma sessão sequestrada:
+# o atacante teria o cookie, mas não o dispositivo TOTP nem a senha.
+#
+# Após a confirmação, a sessão fica "fresca" por SUDO_GRACE_MINUTES para não
+# pedir o código a cada clique dentro de um fluxo administrativo.
+
+_SUDO_UNTIL = "sudo_until"
+
+
+def _sudo_grace_minutes() -> int:
+    return int(current_app.config.get("SUDO_GRACE_MINUTES", 10))
+
+
+def sudo_is_fresh() -> bool:
+    """True se o usuário reconfirmou a identidade dentro da janela de graça."""
+    raw = session.get(_SUDO_UNTIL)
+    if not raw:
+        return False
+    try:
+        return _utcnow() < datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return False
+
+
+def mark_sudo_fresh() -> None:
+    """Marca a sessão como recém-reconfirmada (inicia a janela de graça)."""
+    session[_SUDO_UNTIL] = (
+        _utcnow() + timedelta(minutes=_sudo_grace_minutes())
+    ).isoformat()
+
+
+def clear_sudo() -> None:
+    session.pop(_SUDO_UNTIL, None)
+
+
+def is_safe_redirect_url(target: str | None) -> bool:
+    """True se ``target`` for uma URL local (mesmo host) — evita open redirect."""
+    if not target:
+        return False
+    ref = urlparse(request.host_url)
+    test = urlparse(target)
+    return (not test.netloc or test.netloc == ref.netloc) and test.scheme in ("", "http", "https")
+
+
+def require_fresh_confirmation(view_func):
+    """Exige reconfirmação de identidade (sudo mode) antes de executar a view.
+
+    Se a sessão não estiver fresca, redireciona para a página de confirmação
+    guardando o destino. Deve vir DEPOIS de ``require_role`` na pilha de
+    decorators, para que a checagem de papel ocorra primeiro.
+    """
+
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for("auth.login", next=request.path))
+        if sudo_is_fresh():
+            return view_func(*args, **kwargs)
+        # Num GET (formulário), o destino é a própria página. Num POST, os dados
+        # do formulário se perderiam no redirect, então voltamos para a página de
+        # origem (o usuário refaz a ação já dentro da janela fresca) — caso raro,
+        # já que normalmente a sessão foi confirmada ao abrir o formulário.
+        target = request.url if request.method == "GET" else (
+            request.referrer or url_for("main.dashboard")
+        )
+        return redirect(url_for("auth.confirm_identity", next=target))
+
+    return wrapper
+
+
 __all__ = [
     "require_role",
+    "require_fresh_confirmation",
+    "sudo_is_fresh",
+    "mark_sudo_fresh",
+    "clear_sudo",
+    "is_safe_redirect_url",
     "audit",
     "ROLE_ADMIN",
     "ROLE_OPERATOR",
