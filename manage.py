@@ -138,6 +138,26 @@ def fix_placeholder_macs(profile_id, prefix):
                 )
 
 
+@app.cli.command("dedupe-device-ips")
+@click.option("--profile-id", type=int, default=None, help="Limita a um perfil.")
+def dedupe_device_ips_cmd(profile_id):
+    """Remove linhas DeviceIp duplicadas do mesmo (device, ip).
+
+    Corrige devices (tipicamente roteadores multi-IP) cuja lista repete o mesmo
+    IP por acúmulo de linhas de histórico. Mantém uma linha por IP.
+    """
+    from app.scanner.scheduling import dedupe_device_ips
+
+    with app.app_context():
+        stats = dedupe_device_ips(profile_id=profile_id)
+        click.echo(
+            f"Devices afetados: {stats['devices_affected']} | "
+            f"Linhas removidas: {stats['rows_removed']}"
+        )
+        for d in stats["details"]:
+            click.echo(f"  device #{d['device_id']}  {d['ip']:<16} -{d['removed']} linha(s)")
+
+
 @app.cli.command("backup-db")
 @click.option("--dest", default=None, help="Diretório de destino (padrão: BACKUP_DIR do config).")
 @click.option("--compress/--no-compress", default=True, help="Comprime o backup com gzip.")

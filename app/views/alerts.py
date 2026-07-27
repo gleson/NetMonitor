@@ -28,10 +28,12 @@ def alert_list():
     page = request.args.get("page", 1, type=int)
 
     # Ordenação por coluna (agrupa por severidade, tipo, dispositivo, etc.).
+    # Sem ?sort= (carregamento inicial) usa a ordenação padrão composta;
+    # com clique num cabeçalho, ordena apenas pela coluna escolhida.
     _valid_sorts = {"created", "severity", "type", "device", "status"}
-    sort = request.args.get("sort", "created")
+    sort = request.args.get("sort", "")
     if sort not in _valid_sorts:
-        sort = "created"
+        sort = ""
     direction = "asc" if request.args.get("dir") == "asc" else "desc"
     descending = direction == "desc"
 
@@ -90,15 +92,16 @@ def alert_list():
     def _dir(col):
         return col.desc() if descending else col.asc()
 
+    # Rank explícito: CRITICAL > WARNING > INFO (a ordem alfabética do enum
+    # não reflete a gravidade real).
+    sev_rank = db.case(
+        (Alert.severity == Severity.CRITICAL, 3),
+        (Alert.severity == Severity.WARNING, 2),
+        (Alert.severity == Severity.INFO, 1),
+        else_=0,
+    )
+
     if sort == "severity":
-        # Rank explícito: CRITICAL > WARNING > INFO (a ordem alfabética do enum
-        # não reflete a gravidade real).
-        sev_rank = db.case(
-            (Alert.severity == Severity.CRITICAL, 3),
-            (Alert.severity == Severity.WARNING, 2),
-            (Alert.severity == Severity.INFO, 1),
-            else_=0,
-        )
         query = query.order_by(_dir(sev_rank), Alert.created_at.desc())
     elif sort == "type":
         query = query.order_by(_dir(Alert.alert_type), Alert.created_at.desc())
@@ -114,8 +117,16 @@ def alert_list():
         query = query.order_by(
             _dir(Alert.acknowledged_at.is_(None)), Alert.created_at.desc()
         )
-    else:  # "created" (padrão) — prioritários no topo, depois mais recentes.
-        query = query.order_by(Alert.is_priority.desc(), _dir(Alert.created_at))
+    elif sort == "created":
+        query = query.order_by(_dir(Alert.created_at))
+    else:
+        # Padrão (sem sort explícito): críticos primeiro, abertos antes de
+        # reconhecidos e, por fim, mais recentes primeiro.
+        query = query.order_by(
+            sev_rank.desc(),
+            Alert.acknowledged_at.is_(None).desc(),
+            Alert.created_at.desc(),
+        )
 
     pagination = query.paginate(page=page, per_page=25, error_out=False)
 

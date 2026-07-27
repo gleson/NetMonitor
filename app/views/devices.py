@@ -177,9 +177,14 @@ def device_list():
             .all()
         )
         # Devices multi-IP: exibe todos os IPs atuais separados por vírgula
-        # (o mais recente por último graças à ordenação acima).
+        # (o mais recente por último graças à ordenação acima). Deduplica por IP
+        # para não repetir quando há linhas DeviceIp duplicadas para o mesmo IP.
+        _ip_lists: dict[int, list[str]] = {}
         for did, ip in ip_rows:
-            current_ips[did] = f"{current_ips[did]}, {ip}" if did in current_ips else ip
+            lst = _ip_lists.setdefault(did, [])
+            if ip not in lst:
+                lst.append(ip)
+        current_ips = {did: ", ".join(lst) for did, lst in _ip_lists.items()}
 
         count_rows = (
             Port.query

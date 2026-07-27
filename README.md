@@ -125,8 +125,17 @@ gunicorn 'manage:app'
 
 Acesse `http://localhost:5000` e faça login.
 
-> **Permissões de root:** SYN scan (`-sS`) e detecção de SO (`-O`) exigem root.
-> Sem root, o scanner cai automaticamente para TCP connect (`-sT`).
+> **Permissões de root:** ARP scan direto, SYN scan (`-sS`), scan UDP (`-sU`),
+> detecção de SO (`-O`) e a descoberta passiva de ARP exigem root (o código
+> checa `os.geteuid() == 0`). Sem root, o scanner cai automaticamente para
+> TCP connect (`-sT`)/nmap host discovery, e a descoberta passiva não inicia.
+> Para rodar com root de forma restrita (bounding set de capabilities
+> reduzido ao mínimo — rede crua + acesso aos arquivos de `instance/` e
+> `backups/`, sem `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE`/etc.), use:
+> ```bash
+> sudo scripts/start_root.sh dev     # flask run
+> sudo scripts/start_root.sh prod    # gunicorn
+> ```
 
 > **Gunicorn multi-worker:** o scheduler é iniciado por **um único** processo,
 > garantido por um lock de arquivo (`flock`) — os scans não são duplicados.

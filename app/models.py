@@ -433,13 +433,23 @@ class Device(db.Model):
 
     @property
     def current_ips(self) -> list[str]:
-        """Todos os IPs atuais — devices multi-IP (is_multi_ip) têm mais de um."""
+        """Todos os IPs atuais — devices multi-IP (is_multi_ip) têm mais de um.
+
+        Deduplica defensivamente por IP: se o banco tiver linhas duplicadas para
+        o mesmo (device, ip) marcadas como current, o IP aparece uma única vez.
+        """
         rows = (
             DeviceIp.query.filter_by(device_id=self.id, is_current=True)
             .order_by(DeviceIp.last_seen_at.desc())
             .all()
         )
-        return [r.ip for r in rows]
+        seen: set[str] = set()
+        result: list[str] = []
+        for r in rows:
+            if r.ip not in seen:
+                seen.add(r.ip)
+                result.append(r.ip)
+        return result
 
     @property
     def open_ports_count(self):

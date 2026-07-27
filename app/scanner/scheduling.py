@@ -6,6 +6,7 @@ Cada job usa app_context para acessar o banco de dados.
 
 import ipaddress
 import logging
+import os
 import re
 import threading
 import time
@@ -53,10 +54,47 @@ _port_scan_retry_args: dict[int, int] = {}
 _port_scan_bug_attempts: dict[int, int] = {}
 _port_scan_retry_lock = threading.Lock()
 
+# Sequência de argumentos nmap alternativos para reencontrar portas que
+# "sumiram" (scan retornou 0 num host comprovadamente online). Firewalls/IDS
+# costumam dropar o tipo de probe original mas responder a outro tipo, a um
+# timing mais paciente, a uma source-port confiável ou a pacotes fragmentados.
+# Cada variante tem um caminho root (probes crus: SYN, -f, -g) e um fallback
+# sem root (connect scan com timings/atrasos distintos). Mantemos
+# --host-timeout em todas para não travar o scheduler.
+#
+# NÃO usar -sA (ACK scan) aqui: ele nunca reporta 'open' (só detecta filtragem,
+# devolvendo 'unfiltered'), o que poluiria o estado das portas e geraria
+# alertas espúrios [open → unfiltered] em vez de reencontrar as portas.
+_IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_ALTERNATE_SCAN_SEQUENCE: list[str] = [
+    # 1) Connect scan + versão leve — útil quando o roteador filtra SYN.
+    "-Pn -sT -sV -T4 --version-intensity 2 --host-timeout 300s",
+    # 2) Probe mais lento com retries — SYN (root) ou connect (sem root).
+    ("-Pn -sS -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"
+     if _IS_ROOT
+     else "-Pn -sT -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"),
+    # 3) Connect scan lento e paciente, sem -sV, para hosts que limitam a taxa
+    #    de conexões / têm IDS que descarta rajadas.
+    "-Pn -sT -T2 --max-retries 2 --host-timeout 400s",
+    # 4) Truque de source-port: muitos firewalls stateless liberam tráfego vindo
+    #    da porta 53 (DNS). -g exige root p/ portas <1024; sem root usa um
+    #    connect scan com scan-delay (perfil de timing diferente, dribla
+    #    rate-limiting simples).
+    ("-Pn -sS -g 53 -T3 --host-timeout 400s"
+     if _IS_ROOT
+     else "-Pn -sT -T3 --scan-delay 150ms --host-timeout 500s"),
+    # 5) Evasão por fragmentação + payload aleatório (root): quebra os probes em
+    #    fragmentos IP pequenos, driblando filtros de pacote simples e algumas
+    #    assinaturas de IDS. Sem root (connect não fragmenta): scan T1 bem lento.
+    ("-Pn -sS -f --data-length 24 -T2 --host-timeout 500s"
+     if _IS_ROOT
+     else "-Pn -sT -T1 --max-retries 3 --host-timeout 600s"),
+]
+
 # Máximo de rodadas com scan alternativo antes de aceitar que as portas
-# fecharam de fato. Igual ao tamanho da sequência de _next_alternate_nmap_args
-# (uma tentativa por variante de scan).
-_PORT_SCAN_MAX_BUG_RETRIES = 3
+# fecharam de fato — uma tentativa por variante da sequência acima. Derivado do
+# tamanho da sequência para nunca sair de sincronia ao adicionar variantes.
+_PORT_SCAN_MAX_BUG_RETRIES = len(_ALTERNATE_SCAN_SEQUENCE)
 
 
 def _utcnow():
@@ -444,11 +482,21 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     from app.models import DeviceIp, Alert, AlertType, Severity
 
     if device.is_multi_ip:
-        known = DeviceIp.query.filter_by(device_id=device.id, ip=ip).first()
-        if known:
-            known.last_seen_at = now
+        # Pode haver mais de uma linha para o mesmo IP (acúmulo de flips antigos
+        # antes de o device virar multi-IP). Mantém UMA como current e colapsa as
+        # demais, senão a lista de dispositivos repetiria o IP.
+        rows_for_ip = (
+            DeviceIp.query.filter_by(device_id=device.id, ip=ip)
+            .order_by(DeviceIp.last_seen_at.desc())
+            .all()
+        )
+        if rows_for_ip:
+            keep = rows_for_ip[0]
+            keep.last_seen_at = now
             # Reativa IPs rebaixados antes de o device ser marcado como multi-IP.
-            known.is_current = True
+            keep.is_current = True
+            for extra in rows_for_ip[1:]:
+                db.session.delete(extra)
             return
         db.session.add(DeviceIp(
             device_id=device.id, ip=ip,
@@ -496,10 +544,21 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         row.is_current = False
         row.last_seen_at = now
 
-    db.session.add(DeviceIp(
-        device_id=device.id, ip=ip,
-        first_seen_at=now, last_seen_at=now, is_current=True,
-    ))
+    # Reaproveita uma linha existente (rebaixada) para este IP se já houver —
+    # evita acumular linhas duplicadas do mesmo IP a cada oscilação de IP.
+    existing_for_ip = (
+        DeviceIp.query.filter_by(device_id=device.id, ip=ip)
+        .order_by(DeviceIp.last_seen_at.desc())
+        .first()
+    )
+    if existing_for_ip is not None:
+        existing_for_ip.is_current = True
+        existing_for_ip.last_seen_at = now
+    else:
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip,
+            first_seen_at=now, last_seen_at=now, is_current=True,
+        ))
     emit_alert(
         profile.id, device.id, AlertType.NEW_IP_FOR_MAC, Severity.WARNING,
         (
@@ -509,6 +568,65 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         match_value=ip, notify_profile=profile, notify_device=device,
     )
     logger.info("IP mudou para device %s: %s -> %s", device.mac, previous.ip, ip)
+
+
+def dedupe_device_ips(profile_id: int | None = None) -> dict:
+    """Colapsa linhas DeviceIp duplicadas do mesmo (device, ip).
+
+    Devices multi-IP (roteador com o mesmo MAC em várias redes) que oscilaram de
+    IP muitas vezes antes de serem marcados como multi-IP acumulam dezenas de
+    linhas para o mesmo IP, algumas com is_current=True — o que faz a lista de
+    dispositivos repetir o IP. Para cada (device_id, ip) mantém UMA linha (a de
+    last_seen mais recente), preservando o first_seen mais antigo e marcando-a
+    como current se qualquer duplicata era current; remove as demais.
+
+    Retorna estatísticas: devices afetados, linhas removidas.
+    """
+    from app.extensions import db
+    from app.models import Device, DeviceIp
+
+    q = Device.query
+    if profile_id is not None:
+        q = q.filter_by(profile_id=profile_id)
+
+    devices_affected = 0
+    rows_removed = 0
+    details: list[dict] = []
+
+    for device in q.all():
+        rows = DeviceIp.query.filter_by(device_id=device.id).all()
+        by_ip: dict[str, list] = {}
+        for r in rows:
+            by_ip.setdefault(r.ip, []).append(r)
+
+        device_touched = False
+        for ip, group in by_ip.items():
+            if len(group) < 2:
+                continue
+            # Mantém a linha vista mais recentemente.
+            group.sort(key=lambda r: (r.last_seen_at or datetime.min), reverse=True)
+            keep = group[0]
+            keep.is_current = any(r.is_current for r in group)
+            first_seens = [r.first_seen_at for r in group if r.first_seen_at]
+            if first_seens:
+                keep.first_seen_at = min(first_seens)
+            for extra in group[1:]:
+                db.session.delete(extra)
+                rows_removed += 1
+            device_touched = True
+            details.append({
+                "device_id": device.id, "ip": ip, "removed": len(group) - 1,
+            })
+
+        if device_touched:
+            devices_affected += 1
+
+    db.session.commit()
+    return {
+        "devices_affected": devices_affected,
+        "rows_removed": rows_removed,
+        "details": details,
+    }
 
 
 def run_host_discovery(profile_id: int):
@@ -1020,27 +1138,11 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
 def _alternate_scan_sequence() -> list[str]:
     """Sequência de argumentos nmap alternativos para reencontrar portas.
 
-    Usada quando um scan retorna 0 portas em um host comprovadamente online —
-    firewalls que dropam o tipo de probe original (ex.: SYN) muitas vezes
-    respondem a outro (ex.: connect), ou a um timing mais paciente.
-
-    Mantemos --host-timeout para não travar o scheduler.
+    Usada quando um scan retorna 0 portas em um host comprovadamente online.
+    Ver `_ALTERNATE_SCAN_SEQUENCE` (definida no topo do módulo) para as variantes
+    e a motivação de cada uma.
     """
-    import os
-    return [
-        # Connect scan + Pn — útil quando o roteador filtra SYN.
-        "-Pn -sT -sV -T4 --version-intensity 2 --host-timeout 300s",
-        # SYN + tentativa mais lenta com retries — root only; sem root cai p/ sT.
-        ("-Pn -sS -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"
-         if os.geteuid() == 0
-         else "-Pn -sT -sV -T3 --version-intensity 2 --max-retries 3 --host-timeout 300s"),
-        # Connect scan lento e paciente, sem -sV (mais leve, menos host-timeout),
-        # para hosts que limitam a taxa de conexões / têm IDS que descarta rajadas.
-        # NÃO usar -sA aqui: o ACK scan nunca reporta 'open' (só detecta filtragem,
-        # devolvendo 'unfiltered'), então poluiria o estado das portas e geraria
-        # alertas espúrios [open → unfiltered] em vez de reencontrar as portas.
-        "-Pn -sT -T2 --max-retries 2 --host-timeout 400s",
-    ]
+    return _ALTERNATE_SCAN_SEQUENCE
 
 
 def _next_alternate_nmap_args(device_id: int) -> str:
@@ -1343,13 +1445,18 @@ def run_port_scan(profile_id: int):
                         )
 
                 # --- Detecção de "bug de portas sumidas" ---
-                # Se o device tinha >=2 portas mapeadas e o scan retornou 0,
-                # tratamos como falha (provável bloqueio de firewall transitório
-                # ou perda de pacotes), NÃO fechamos as portas e re-enfileiramos
-                # com scan type alternativo. Só faz sentido se o MAC continua o
-                # mesmo (DHCP swap muda o MAC junto, tratado em run_host_discovery).
+                # Se o device tinha >=1 porta mapeada (aberta OU filtrada) e o
+                # scan retornou 0, tratamos como falha (provável bloqueio de
+                # firewall transitório ou perda de pacotes): NÃO fechamos as
+                # portas e re-enfileiramos com scan type alternativo. Inclui
+                # hosts de porta única — antes eles eram fechados na hora e
+                # re-alertavam quando a porta voltava. O ciclo é limitado por
+                # _PORT_SCAN_MAX_BUG_RETRIES, então um fechamento legítimo é
+                # aceito depois de esgotar as variantes. Só faz sentido se o MAC
+                # continua o mesmo (DHCP swap muda o MAC junto, tratado em
+                # run_host_discovery).
                 ports_vanished_bug = (
-                    host_found and len(old_set) >= 2 and len(found_set) == 0
+                    host_found and len(old_set) >= 1 and len(found_set) == 0
                 )
 
                 # Depois de esgotar a sequência de scans alternativos sem

@@ -164,7 +164,7 @@ class TestPortsVanishedGiveUp:
             device_id=device.id, ip="192.168.1.50", is_current=True,
             first_seen_at=now, last_seen_at=now,
         ))
-        # Duas portas abertas: >= 2 é o gatilho da heurística de "portas sumidas".
+        # >= 1 porta aberta/filtrada é o gatilho da heurística de "portas sumidas".
         for pnum in (80, 443):
             db.session.add(Port(
                 device_id=device.id, protocol="tcp", port=pnum, state="open",
@@ -194,6 +194,55 @@ class TestPortsVanishedGiveUp:
             # O estado de retry do device é limpo ao aceitar o fechamento.
             assert did not in scheduling._port_scan_bug_attempts
             assert did not in scheduling._port_scan_retry_args
+        finally:
+            with scheduling._port_scan_queues_lock:
+                scheduling._port_scan_queues.pop(sample_profile.id, None)
+            with scheduling._port_scan_retry_lock:
+                scheduling._port_scan_bug_attempts.pop(did, None)
+                scheduling._port_scan_retry_args.pop(did, None)
+
+
+    def test_single_port_host_not_closed_on_transient_zero(
+        self, db, sample_profile, sample_range, monkeypatch
+    ):
+        """Host com UMA porta que retorna 0 não é fechado na hora — dispara a
+        heurística de portas sumidas (antes só valia para >= 2 portas, então
+        hosts de porta única fechavam e re-alertavam quando a porta voltava)."""
+        from app.models import Device, DeviceIp, Port, _utcnow
+        from app.scanner import scheduling
+        import app.scanner.ports as ports_mod
+        import app.scanner.hosts as hosts_mod
+
+        now = _utcnow()
+        device = Device(
+            profile_id=sample_profile.id, mac="AA:BB:CC:DD:EE:77", last_seen_at=now,
+        )
+        db.session.add(device)
+        db.session.flush()
+        db.session.add(DeviceIp(
+            device_id=device.id, ip="192.168.1.51", is_current=True,
+            first_seen_at=now, last_seen_at=now,
+        ))
+        db.session.add(Port(
+            device_id=device.id, protocol="tcp", port=22, state="open",
+            first_open_at=now, last_seen_open_at=now,
+        ))
+        db.session.commit()
+        did = device.id
+
+        monkeypatch.setattr(hosts_mod, "is_host_reachable", lambda ip, *a, **k: (True, "icmp"))
+        monkeypatch.setattr(ports_mod, "scan_ports_for_host", lambda *a, **k: ([], True))
+
+        def _open_count():
+            return Port.query.filter_by(device_id=did).filter(
+                Port.last_seen_closed_at.is_(None)
+            ).count()
+
+        try:
+            scheduling.run_port_scan(sample_profile.id)
+            # A porta única NÃO foi fechada; o device entrou no ciclo de retry.
+            assert _open_count() == 1
+            assert scheduling._port_scan_bug_attempts.get(did) == 1
         finally:
             with scheduling._port_scan_queues_lock:
                 scheduling._port_scan_queues.pop(sample_profile.id, None)
@@ -516,3 +565,83 @@ class TestMultiIpDevice:
 
         current = DeviceIp.query.filter_by(device_id=device.id, is_current=True).all()
         assert [c.ip for c in current] == ["192.168.50.1"]
+
+    def test_multi_ip_upsert_collapses_duplicate_rows(self, db, sample_profile):
+        """Linhas duplicadas para o mesmo IP (acúmulo antigo) são colapsadas ao
+        ver o device de novo — a lista não deve repetir o IP."""
+        from app.models import DeviceIp, _utcnow
+        from app.scanner.scheduling import _upsert_device_ip
+
+        device = self._mk_device(
+            db, sample_profile, "AA:BB:CC:DD:EE:52", "192.168.100.1", multi=True,
+        )
+        now = _utcnow()
+        # Semeia duas linhas current extras para o mesmo IP (estado corrompido).
+        for _ in range(2):
+            db.session.add(DeviceIp(
+                device_id=device.id, ip="192.168.100.1", is_current=True,
+                first_seen_at=now, last_seen_at=now,
+            ))
+        db.session.commit()
+        assert DeviceIp.query.filter_by(device_id=device.id, ip="192.168.100.1").count() == 3
+
+        _upsert_device_ip(sample_profile, device, "192.168.100.1", _utcnow())
+        db.session.commit()
+
+        # Sobra exatamente uma linha para o IP, e current_ips não repete.
+        assert DeviceIp.query.filter_by(device_id=device.id, ip="192.168.100.1").count() == 1
+        assert device.current_ips == ["192.168.100.1"]
+
+    def test_single_ip_flip_back_reuses_row(self, db, sample_profile):
+        """Oscilar entre dois IPs não deve acumular linhas: ao voltar para um IP
+        já conhecido, a linha rebaixada é reaproveitada em vez de duplicada."""
+        from app.models import DeviceIp, _utcnow
+        from app.scanner.scheduling import _upsert_device_ip
+
+        device = self._mk_device(
+            db, sample_profile, "AA:BB:CC:DD:EE:51", "192.168.1.10", multi=False,
+        )
+        # Vai e volta várias vezes entre dois IPs.
+        for _ in range(3):
+            _upsert_device_ip(sample_profile, device, "192.168.1.11", _utcnow())
+            _upsert_device_ip(sample_profile, device, "192.168.1.10", _utcnow())
+        db.session.commit()
+
+        # No máximo uma linha por IP distinto — sem acúmulo.
+        assert DeviceIp.query.filter_by(device_id=device.id).count() == 2
+        current = DeviceIp.query.filter_by(device_id=device.id, is_current=True).all()
+        assert [c.ip for c in current] == ["192.168.1.10"]
+
+    def test_dedupe_device_ips_helper(self, db, sample_profile):
+        from app.models import Device, DeviceIp, _utcnow
+        from app.scanner.scheduling import dedupe_device_ips
+        from datetime import timedelta
+
+        now = _utcnow()
+        device = Device(
+            profile_id=sample_profile.id, mac="AA:BB:CC:DD:EE:50",
+            last_seen_at=now, is_multi_ip=True,
+        )
+        db.session.add(device)
+        db.session.flush()
+        # 3x .100.1 (1 current) e 2x .50.1 (0 current).
+        for i in range(3):
+            db.session.add(DeviceIp(
+                device_id=device.id, ip="192.168.100.1", is_current=(i == 0),
+                first_seen_at=now - timedelta(days=i), last_seen_at=now - timedelta(hours=i),
+            ))
+        for i in range(2):
+            db.session.add(DeviceIp(
+                device_id=device.id, ip="192.168.50.1", is_current=False,
+                first_seen_at=now - timedelta(days=i), last_seen_at=now - timedelta(hours=i),
+            ))
+        db.session.commit()
+
+        stats = dedupe_device_ips(profile_id=sample_profile.id)
+        assert stats["rows_removed"] == 3  # (3-1) + (2-1)
+        rows = DeviceIp.query.filter_by(device_id=device.id).all()
+        assert len(rows) == 2
+        by_ip = {r.ip: r for r in rows}
+        # A linha .100.1 mantida preserva o current e o first_seen mais antigo.
+        assert by_ip["192.168.100.1"].is_current is True
+        assert by_ip["192.168.100.1"].first_seen_at == now - timedelta(days=2)
