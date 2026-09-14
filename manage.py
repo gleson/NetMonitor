@@ -211,6 +211,29 @@ def run_cve_scan():
     )
 
 
+@app.cli.command("verify-audit-chain")
+@click.option("--limit", type=int, default=None,
+              help="Verifica apenas as N entradas mais recentes.")
+def verify_audit_chain_cmd(limit):
+    """Confere a cadeia de integridade do audit log.
+
+    Sai com código 1 quando encontra violação, para poder ser usado em cron ou
+    monitoramento externo.
+    """
+    from app.audit_chain import verify_audit_chain
+    with app.app_context():
+        r = verify_audit_chain(limit=limit)
+    click.echo(r["summary"])
+    if r["first_id"] is not None:
+        click.echo(f"Faixa verificada: id {r['first_id']} a {r['last_id']}.")
+    if not r["ok"]:
+        if r["tampered"]:
+            click.echo(f"Conteúdo alterado nos ids: {r['tampered']}")
+        if r["broken_links"]:
+            click.echo(f"Elos rompidos nos ids: {r['broken_links']}")
+        raise SystemExit(1)
+
+
 @app.cli.command("generate-fernet-key")
 def generate_fernet_key():
     """Gera uma nova chave Fernet para cifrar credenciais SNMP."""

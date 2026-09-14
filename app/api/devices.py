@@ -104,6 +104,9 @@ def _device_to_dict(device: Device) -> dict:
         "device_type": device.device_type.value if device.device_type else "OTHER",
         "os_guess": device.os_guess,
         "current_ip": device.current_ip,
+        # IPv6 do mesmo ativo (agrupados pelo MAC). Lista: um host IPv6 costuma
+        # ter link-local + global/ULA + endereços temporários ao mesmo tempo.
+        "current_ipv6": device.current_ipv6s,
         "open_ports_count": device.open_ports_count,
         "truly_open_ports_count": device.truly_open_ports_count,
         "first_seen_at": to_iso(device.first_seen_at),

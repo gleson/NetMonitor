@@ -52,7 +52,19 @@ _port_scan_retry_args: dict[int, int] = {}
 # fechou legitimamente todas as portas (ex.: firewall ligado) seria
 # reescaneado para sempre a cada ciclo. Protegido por _port_scan_retry_lock.
 _port_scan_bug_attempts: dict[int, int] = {}
+# (device_id, protocol, port) -> nº de scans consecutivos em que uma porta antes
+# mapeada não foi reencontrada num host comprovadamente online, sem que TODAS as
+# portas sumissem (perda parcial — o caso de perda total é tratado pelo
+# "bug de portas sumidas" com scan alternativo). Perda parcial costuma ser
+# transitória (perda de pacote / firewall momentâneo / rate-limit), então não
+# fechamos a porta no primeiro miss: exigimos _PORT_CLOSE_MISS_THRESHOLD misses
+# consecutivos. Sem essa carência a porta fecha e re-alerta como "nova" quando
+# reaparece no ciclo seguinte, gerando ruído. Protegido por _port_scan_retry_lock.
+_port_miss_counts: dict[tuple[int, str, int], int] = {}
 _port_scan_retry_lock = threading.Lock()
+
+# Misses consecutivos numa porta (host online) antes de aceitar seu fechamento.
+_PORT_CLOSE_MISS_THRESHOLD = 2
 
 # Sequência de argumentos nmap alternativos para reencontrar portas que
 # "sumiram" (scan retornou 0 num host comprovadamente online). Firewalls/IDS
@@ -242,6 +254,50 @@ def _register_profile_jobs(app: Flask, profile):
     else:
         _remove_job_quiet(udp_job_id)
 
+    # Port scan sobre IPv6 — opcional, ligável em runtime em /admin/scan-settings.
+    # Não exige root (cai para -sT como o scan IPv4).
+    ipv6_scan_job_id = f"ipv6_portscan_profile_{profile.id}"
+    ipv6_hours = int(app.config.get("IPV6_PORT_SCAN_INTERVAL_HOURS", 12))
+    from app.ipv6_settings import is_ipv6_port_scan_enabled
+    if ipv6_hours > 0 and is_ipv6_port_scan_enabled(app):
+        scheduler.add_job(
+            func=_run_with_context,
+            args=[app, run_ipv6_port_scan, profile.id],
+            trigger="interval",
+            hours=ipv6_hours,
+            id=ipv6_scan_job_id,
+            name=f"Port Scan IPv6 - {profile.name}",
+            replace_existing=True,
+            max_instances=1,
+            # Depois da primeira discovery (90s): sem endereços IPv6 catalogados
+            # o job não teria alvo nenhum.
+            next_run_time=_preserve_or_default(ipv6_scan_job_id, 480),
+        )
+    else:
+        _remove_job_quiet(ipv6_scan_job_id)
+
+    # Configurações inseguras conhecidas (SMBv1, assinatura SMB, comunidade
+    # SNMP de fábrica). Não exige root: NSE de SMB por TCP e SNMP por pysnmp.
+    hardening_job_id = f"hardening_profile_{profile.id}"
+    hardening_hours = int(app.config.get("HARDENING_CHECK_INTERVAL_HOURS", 24))
+    from app.scanner.hardening import is_hardening_enabled, run_hardening_checks
+    if hardening_hours > 0 and is_hardening_enabled(app):
+        scheduler.add_job(
+            func=_run_with_context,
+            args=[app, run_hardening_checks, profile.id],
+            trigger="interval",
+            hours=hardening_hours,
+            id=hardening_job_id,
+            name=f"Checagem de Configuração - {profile.name}",
+            replace_existing=True,
+            max_instances=1,
+            # Depois do primeiro port scan: sem portas mapeadas o alvo de SMB
+            # sairia vazio.
+            next_run_time=_preserve_or_default(hardening_job_id, 600),
+        )
+    else:
+        _remove_job_quiet(hardening_job_id)
+
     # Topologia L2 (LLDP + FDB via SNMP) — opcional, desligada por padrão.
     topology_job_id = f"topology_profile_{profile.id}"
     from app.scanner.topology import is_topology_enabled
@@ -324,6 +380,97 @@ def sync_topology_jobs(app: Flask) -> None:
         _register_profile_jobs(app, profile)
 
 
+def sync_hardening_jobs(app: Flask) -> None:
+    """Re-registra/remove o job de checagem de configuração ao alternar a flag.
+
+    Reaproveita ``_register_profile_jobs`` (idempotente, replace_existing), que
+    já cria ou remove o job conforme ``is_hardening_enabled``.
+    """
+    from app.extensions import scheduler
+    from app.models import Profile
+
+    if not scheduler.running:
+        return
+    for profile in Profile.query.filter_by(is_active=True).all():
+        _register_profile_jobs(app, profile)
+
+
+def sync_dns_check_job(app: Flask) -> None:
+    """Registra ou remove o job global de integridade do DNS conforme a flag.
+
+    Job global (não por perfil): a lista de resolvedores é do host do monitor.
+    A avaliação por perfil acontece dentro do próprio job.
+    """
+    from app.extensions import scheduler
+    from app.scanner.dns_check import check_dns_integrity, is_dns_check_enabled
+
+    if not scheduler.running:
+        return
+
+    hours = int(app.config.get("DNS_CHECK_INTERVAL_HOURS", 6))
+    if not is_dns_check_enabled(app) or hours <= 0:
+        _remove_job_quiet("global_dns_check")
+        return
+
+    scheduler.add_job(
+        func=_run_with_context,
+        args=[app, check_dns_integrity],
+        trigger="interval",
+        hours=hours,
+        id="global_dns_check",
+        name="DNS Integrity Check",
+        replace_existing=True,
+        max_instances=1,
+        next_run_time=_utcnow() + timedelta(minutes=1),
+    )
+
+
+def sync_wifi_watch_job(app: Flask) -> None:
+    """Registra ou remove o job global de vigilância Wi-Fi conforme a flag.
+
+    Job global (não por perfil): a placa de rádio é do host do monitor, e uma
+    varredura serve a todos os perfis. A avaliação por perfil (baseline e SSIDs
+    vigiados) acontece dentro do próprio job.
+    """
+    from app.extensions import scheduler
+    from app.scanner.wireless import is_wifi_watch_enabled, watch_wireless_environment
+
+    if not scheduler.running:
+        return
+
+    hours = int(app.config.get("WIFI_SCAN_INTERVAL_HOURS", 1))
+    if not is_wifi_watch_enabled(app) or hours <= 0:
+        _remove_job_quiet("global_wifi_watch")
+        return
+
+    scheduler.add_job(
+        func=_run_with_context,
+        args=[app, watch_wireless_environment],
+        trigger="interval",
+        hours=hours,
+        id="global_wifi_watch",
+        name="Wireless Environment Watch",
+        replace_existing=True,
+        max_instances=1,
+        next_run_time=_utcnow() + timedelta(minutes=1),
+    )
+
+
+def sync_ipv6_jobs(app: Flask) -> None:
+    """Re-registra/remove o job de port scan IPv6 quando o admin alterna a flag.
+
+    Reaproveita ``_register_profile_jobs`` (idempotente, replace_existing), que
+    já cria ou remove o job conforme ``is_ipv6_port_scan_enabled``.
+    """
+    from app.extensions import scheduler
+    from app.models import Profile
+
+    if not scheduler.running:
+        return
+    for profile in Profile.query.filter_by(is_active=True).all():
+        _register_profile_jobs(app, profile)
+
+
 def sync_profile_jobs(app: Flask, profile) -> None:
     """Registra ou atualiza os jobs de scan de um perfil no scheduler em execução.
 
@@ -357,6 +504,8 @@ def remove_profile_jobs(profile_id: int) -> None:
         f"host_down_profile_{profile_id}",
         f"critical_ports_profile_{profile_id}",
         f"udp_scan_profile_{profile_id}",
+        f"ipv6_portscan_profile_{profile_id}",
+        f"hardening_profile_{profile_id}",
         f"topology_profile_{profile_id}",
     ]
     for job_id in job_ids:
@@ -433,6 +582,46 @@ def register_global_jobs(app: Flask):
     else:
         _remove_job_quiet("global_tls_check")
 
+    # Integridade do DNS da rede (lista de resolvedores + domínios âncora).
+    dns_hours = int(app.config.get("DNS_CHECK_INTERVAL_HOURS", 6))
+    from app.scanner.dns_check import check_dns_integrity, is_dns_check_enabled
+    if is_dns_check_enabled(app) and dns_hours > 0:
+        scheduler.add_job(
+            func=_run_with_context,
+            args=[app, check_dns_integrity],
+            trigger="interval",
+            hours=dns_hours,
+            id="global_dns_check",
+            name="DNS Integrity Check",
+            replace_existing=True,
+            max_instances=1,
+            next_run_time=_utcnow() + timedelta(minutes=5),
+        )
+        logger.info("Job global de integridade de DNS registrado (a cada %dh).", dns_hours)
+    else:
+        _remove_job_quiet("global_dns_check")
+        logger.info("Verificação de integridade do DNS desabilitada.")
+
+    # Vigilância do ambiente Wi-Fi (evil twin / ponto de acesso não autorizado).
+    wifi_hours = int(app.config.get("WIFI_SCAN_INTERVAL_HOURS", 1))
+    from app.scanner.wireless import is_wifi_watch_enabled, watch_wireless_environment
+    if is_wifi_watch_enabled(app) and wifi_hours > 0:
+        scheduler.add_job(
+            func=_run_with_context,
+            args=[app, watch_wireless_environment],
+            trigger="interval",
+            hours=wifi_hours,
+            id="global_wifi_watch",
+            name="Wireless Environment Watch",
+            replace_existing=True,
+            max_instances=1,
+            next_run_time=_utcnow() + timedelta(minutes=8),
+        )
+        logger.info("Job global de vigilância Wi-Fi registrado (a cada %dh).", wifi_hours)
+    else:
+        _remove_job_quiet("global_wifi_watch")
+        logger.info("Vigilância do ambiente Wi-Fi desabilitada.")
+
     # Correlação CVE (NVD) — sem tráfego na rede local, só HTTPS externo.
     cve_hours = int(app.config.get("CVE_LOOKUP_INTERVAL_HOURS", 24))
     if app.config.get("CVE_LOOKUP_ENABLED", True) and cve_hours > 0:
@@ -464,6 +653,106 @@ def _run_with_context(app: Flask, func, *args, **kwargs):
 # Job: Host Discovery
 # ---------------------------------------------------------------------------
 
+def check_ip_claim(profile, device, ip: str, now, via: str = "") -> bool:
+    """Detecta outro MAC reivindicando um IP que já pertence a um ativo online.
+
+    É a checagem central anti-MITM do projeto, e vale para as duas famílias:
+    em IPv4 o vetor é o ARP, em IPv6 é o NDP (Neighbor Advertisement) — o
+    mecanismo do ataque é o mesmo, só muda o protocolo que carrega a mentira.
+
+    Classificação:
+    - dono anterior **ainda online** → spoofing (``ARP_SPOOFING`` /
+      ``NDP_SPOOFING``, CRITICAL, prioritário). Se o dono legítimo continua na
+      rede, não é reuso de endereço: é alguém respondendo por um IP que não é
+      dele, que é exatamente o passo 1 de um man-in-the-middle.
+    - dono anterior **sumido** → conflito comum (``IP_CONFLICT``, WARNING).
+      Reatribuição de DHCP produz isso o tempo todo e não é ataque.
+
+    Chamada pela descoberta ativa, pela passiva e pela vizinhança IPv6: um ARP
+    poisoning normalmente envenena o cache da vítima e do gateway sem responder
+    às varreduras do monitor, então depender só do scan ativo deixaria passar o
+    caso mais comum.
+
+    Returns: True se emitiu alerta de conflito/spoofing.
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Alert, AlertType, Device, DeviceIp, Severity
+
+    conflict_dip = (
+        DeviceIp.query
+        .join(Device, DeviceIp.device_id == Device.id)
+        .filter(
+            DeviceIp.ip == ip,
+            DeviceIp.is_current.is_(True),
+            Device.profile_id == profile.id,
+            Device.id != device.id,
+        )
+        .first()
+    )
+    if not conflict_dip:
+        return False
+
+    conflict_dev = db.session.get(Device, conflict_dip.device_id)
+    conflict_mac = conflict_dev.mac if conflict_dev else "?"
+
+    online_minutes = current_app.config.get("HOST_ONLINE_THRESHOLD_MINUTES", 70)
+    spoof_suspect = bool(
+        conflict_dev
+        and conflict_dev.last_seen_at
+        and conflict_dev.last_seen_at >= now - timedelta(minutes=online_minutes)
+    )
+
+    is_v6 = ":" in ip
+    if spoof_suspect:
+        conflict_type = AlertType.NDP_SPOOFING if is_v6 else AlertType.ARP_SPOOFING
+    else:
+        conflict_type = AlertType.IP_CONFLICT
+
+    # Dedupe pelo IP na mensagem. O espaço à direita é obrigatório: sem ele
+    # "192.168.1.1" casaria como substring de "192.168.1.10"/"192.168.1.100" e
+    # suprimiria um conflito real em outro IP. Todas as mensagens abaixo trazem
+    # "{ip} " logo no início, então o delimitador é seguro.
+    already_open = Alert.query.filter_by(
+        profile_id=profile.id,
+        alert_type=conflict_type,
+    ).filter(
+        Alert.message.contains(f"{ip} "),
+        Alert.acknowledged_at.is_(None),
+    ).first()
+    if already_open:
+        return False
+
+    if spoof_suspect:
+        protocol = "NDP" if is_v6 else "ARP"
+        emit_alert(
+            profile.id, device.id, conflict_type, Severity.CRITICAL,
+            (
+                f"Possível {protocol} spoofing: {ip} respondido por {device.mac} "
+                f"enquanto o dono recente {conflict_mac} "
+                f"({conflict_dev.display_name}) ainda estava online{via}"
+            ),
+            match_value=ip, is_priority=True,
+            notify_profile=profile, notify_device=device,
+        )
+    else:
+        emit_alert(
+            profile.id, device.id, AlertType.IP_CONFLICT, Severity.WARNING,
+            (
+                f"Conflito de IP: {ip} reivindicado por "
+                f"{device.mac} e {conflict_mac} simultaneamente{via}"
+            ),
+            match_value=ip,
+            notify_profile=profile, notify_device=device,
+        )
+    logger.warning(
+        "Conflito de IP %s entre %s e %s (spoofing=%s)",
+        ip, device.mac, conflict_mac, spoof_suspect,
+    )
+    return True
+
+
 def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     """Atualiza os DeviceIp de um device visto em ``ip`` (descoberta ativa/passiva).
 
@@ -477,6 +766,11 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     de IP — só um INFO na primeira vez que um IP inédito aparece.
 
     ``via`` é um sufixo para a mensagem do alerta (ex.: " (descoberta passiva)").
+
+    **Escopo IPv4.** Todas as queries filtram ``ip_version == 4``: o IPv6 do
+    mesmo ativo é mantido em paralelo por ``_upsert_device_ipv6`` e as duas
+    famílias não competem. Sem esse filtro, a lógica de "IP único" rebaixaria o
+    IPv6 do device a cada rodada de descoberta IPv4.
     """
     from app.extensions import db
     from app.models import DeviceIp, Alert, AlertType, Severity
@@ -486,7 +780,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         # antes de o device virar multi-IP). Mantém UMA como current e colapsa as
         # demais, senão a lista de dispositivos repetiria o IP.
         rows_for_ip = (
-            DeviceIp.query.filter_by(device_id=device.id, ip=ip)
+            DeviceIp.query.filter_by(device_id=device.id, ip=ip, ip_version=4)
             .order_by(DeviceIp.last_seen_at.desc())
             .all()
         )
@@ -499,7 +793,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
                 db.session.delete(extra)
             return
         db.session.add(DeviceIp(
-            device_id=device.id, ip=ip,
+            device_id=device.id, ip=ip, ip_version=4,
             first_seen_at=now, last_seen_at=now, is_current=True,
         ))
         emit_alert(
@@ -517,6 +811,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     # rebaixar sobras de um período em que o device foi multi-IP.
     current_rows = (
         DeviceIp.query.filter_by(device_id=device.id, is_current=True)
+        .filter(DeviceIp.ip_version == 4)
         .order_by(DeviceIp.last_seen_at.desc())
         .all()
     )
@@ -533,7 +828,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     if not current_rows:
         # Primeiro IP registrado
         db.session.add(DeviceIp(
-            device_id=device.id, ip=ip,
+            device_id=device.id, ip=ip, ip_version=4,
             first_seen_at=now, last_seen_at=now, is_current=True,
         ))
         return
@@ -547,7 +842,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
     # Reaproveita uma linha existente (rebaixada) para este IP se já houver —
     # evita acumular linhas duplicadas do mesmo IP a cada oscilação de IP.
     existing_for_ip = (
-        DeviceIp.query.filter_by(device_id=device.id, ip=ip)
+        DeviceIp.query.filter_by(device_id=device.id, ip=ip, ip_version=4)
         .order_by(DeviceIp.last_seen_at.desc())
         .first()
     )
@@ -556,7 +851,7 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         existing_for_ip.last_seen_at = now
     else:
         db.session.add(DeviceIp(
-            device_id=device.id, ip=ip,
+            device_id=device.id, ip=ip, ip_version=4,
             first_seen_at=now, last_seen_at=now, is_current=True,
         ))
     emit_alert(
@@ -568,6 +863,223 @@ def _upsert_device_ip(profile, device, ip: str, now, via: str = "") -> None:
         match_value=ip, notify_profile=profile, notify_device=device,
     )
     logger.info("IP mudou para device %s: %s -> %s", device.mac, previous.ip, ip)
+
+
+# ---------------------------------------------------------------------------
+# IPv6 — descoberta por vizinhança (NDP)
+# ---------------------------------------------------------------------------
+
+def _upsert_device_ipv6(profile, device, ip: str, now, via: str = "") -> bool:
+    """Registra um endereço IPv6 no ativo, agrupado pelo MAC.
+
+    IPv4 e IPv6 **não competem**: o ativo tem simultaneamente o IPv4 e um ou
+    mais IPv6 marcados como ``is_current``. Um host IPv6 normalmente carrega
+    vários endereços ao mesmo tempo (link-local obrigatório, global/ULA e os
+    temporários de privacy extensions) e todos pertencem ao mesmo equipamento,
+    então aqui nunca se rebaixa um endereço por causa de outro — a expiração
+    fica por conta de ``_expire_stale_ipv6``.
+
+    Mantém no máximo uma linha por (device, ip), como ``_upsert_device_ip``.
+
+    Returns:
+        True se o endereço era inédito para este device (e gerou alerta).
+    """
+    from app.extensions import db
+    from app.models import AlertType, DeviceIp, Severity
+    from app.scanner.hosts6 import ipv6_prefix64, ipv6_scope, strip_zone
+
+    ip = strip_zone(ip)
+    scope = ipv6_scope(ip)
+    if not scope:
+        return False  # multicast/loopback/inválido — não é endereço de ativo
+
+    rows = (
+        DeviceIp.query.filter_by(device_id=device.id, ip=ip, ip_version=6)
+        .order_by(DeviceIp.last_seen_at.desc())
+        .all()
+    )
+    if rows:
+        keep = rows[0]
+        keep.last_seen_at = now
+        keep.is_current = True  # reativa endereço que havia expirado
+        for extra in rows[1:]:
+            db.session.delete(extra)
+        return False
+
+    # Endereço inédito. O prefixo /64 diferencia "o ativo entrou numa rede nova"
+    # de "o ativo trocou o sufixo temporário dentro da mesma rede" (RFC 4941).
+    known_prefixes = {
+        ipv6_prefix64(r.ip)
+        for r in DeviceIp.query.filter_by(device_id=device.id, ip_version=6).all()
+    }
+    prefix = ipv6_prefix64(ip)
+    first_ever = not known_prefixes
+
+    db.session.add(DeviceIp(
+        device_id=device.id, ip=ip, ip_version=6,
+        first_seen_at=now, last_seen_at=now, is_current=True,
+    ))
+
+    if first_ever:
+        detail = "primeiro endereço IPv6 do ativo"
+    elif prefix not in known_prefixes:
+        detail = f"novo prefixo {prefix}"
+    else:
+        detail = f"endereço adicional em {prefix} (provável privacy extension)"
+
+    emit_alert(
+        profile.id, device.id, AlertType.NEW_IP_FOR_MAC, Severity.INFO,
+        (
+            f"Novo IPv6 para {device.display_name} ({device.mac}){via}: "
+            f"{ip} [{scope}] — {detail}"
+        ),
+        match_value=ip, notify_profile=profile, notify_device=device,
+    )
+    logger.info("Novo IPv6 para device %s: %s (%s)", device.mac, ip, scope)
+    return True
+
+
+def _expire_stale_ipv6(profile_id: int, now) -> int:
+    """Desmarca como atuais os IPv6 não vistos há IPV6_ADDRESS_RETENTION_DAYS.
+
+    Sem isso, as privacy extensions (endereço temporário novo a cada ~24h em
+    Windows/Android/iOS) fariam a tela do ativo acumular indefinidamente
+    endereços que não existem mais. Linhas já expiradas há o dobro do período
+    são apagadas — o histórico útil já passou.
+
+    Returns: quantidade de endereços expirados nesta passagem.
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Device, DeviceIp
+
+    try:
+        days = int(current_app.config.get("IPV6_ADDRESS_RETENTION_DAYS", 30))
+    except RuntimeError:
+        days = 30
+    if days <= 0:
+        return 0
+
+    device_ids = db.select(Device.id).where(Device.profile_id == profile_id)
+
+    cutoff = now - timedelta(days=days)
+    stale = (
+        DeviceIp.query
+        .filter(
+            DeviceIp.device_id.in_(device_ids),
+            DeviceIp.ip_version == 6,
+            DeviceIp.is_current.is_(True),
+            DeviceIp.last_seen_at < cutoff,
+        )
+        .all()
+    )
+    for row in stale:
+        row.is_current = False
+
+    purge_cutoff = now - timedelta(days=days * 2)
+    purged = (
+        DeviceIp.query
+        .filter(
+            DeviceIp.device_id.in_(device_ids),
+            DeviceIp.ip_version == 6,
+            DeviceIp.is_current.is_(False),
+            DeviceIp.last_seen_at < purge_cutoff,
+        )
+        .delete(synchronize_session=False)
+    )
+
+    if stale or purged:
+        logger.info(
+            "IPv6 profile %d: %d endereço(s) expirado(s), %d removido(s) do histórico.",
+            profile_id, len(stale), purged,
+        )
+    return len(stale)
+
+
+def discover_ipv6_for_profile(profile) -> dict:
+    """Descobre vizinhos IPv6 e os agrupa nos ativos do perfil pelo MAC.
+
+    Regra de agrupamento: um endereço IPv6 só é anexado a um Device que **já
+    existe** neste perfil com o mesmo MAC. Vizinhos IPv6 cujo MAC é
+    desconhecido são contados e ignorados — nunca criam device.
+
+    O motivo é de correção, não de conservadorismo: só a tabela de vizinhança
+    identifica o MAC real do dono do endereço, e ela cobre apenas o enlace
+    local. Criar ativos a partir de qualquer par (IPv6, MAC) observado abriria a
+    porta para fundir hosts remotos no device do gateway, já que todo tráfego
+    roteado chega com o MAC do roteador.
+
+    Returns:
+        dict com contadores e ``online_device_ids`` (devices cuja presença o
+        kernel confirmou agora — entram no snapshot de online do ciclo).
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Device
+    from app.ipv6_settings import is_ipv6_discovery_enabled
+    from app.scanner.hosts6 import SCOPE_LINK_LOCAL, discover_ipv6_neighbors
+    from app.scanner.mitm import is_mitm_detection_enabled
+
+    stats = {
+        "neighbors": 0, "attached": 0, "new_addresses": 0,
+        "unmatched": 0, "online_device_ids": set(),
+    }
+
+    if not is_ipv6_discovery_enabled(current_app):
+        logger.debug("Descoberta IPv6 desabilitada — ignorando (profile %d).", profile.id)
+        return stats
+
+    neighbors = discover_ipv6_neighbors()
+    if not current_app.config.get("IPV6_INCLUDE_LINK_LOCAL", True):
+        neighbors = [n for n in neighbors if n.scope != SCOPE_LINK_LOCAL]
+    if not neighbors:
+        return stats
+    stats["neighbors"] = len(neighbors)
+
+    mitm_enabled = is_mitm_detection_enabled(current_app)
+    macs = {n.mac for n in neighbors}
+    devices = {
+        d.mac: d
+        for d in Device.query.filter(
+            Device.profile_id == profile.id, Device.mac.in_(macs)
+        ).all()
+    }
+
+    now = _utcnow()
+    for neighbor in neighbors:
+        device = devices.get(neighbor.mac)
+        if device is None:
+            stats["unmatched"] += 1
+            continue
+        # NDP spoofing: outro ativo online já reivindica este IPv6.
+        if mitm_enabled:
+            check_ip_claim(profile, device, neighbor.ip, now, via=" (vizinhança IPv6)")
+        if _upsert_device_ipv6(profile, device, neighbor.ip, now, via=" (vizinhança IPv6)"):
+            stats["new_addresses"] += 1
+        stats["attached"] += 1
+
+        # Só uma entrada NUD confirmada recentemente prova presença: entradas
+        # STALE sobrevivem ~30 min ao host sumir e marcariam como online um
+        # ativo que já saiu da rede.
+        if neighbor.is_fresh:
+            device.last_seen_at = now
+            device.record_online_today(now.date())
+            _ack_open_host_down_alerts(device.id, now)
+            stats["online_device_ids"].add(device.id)
+
+    db.session.commit()
+    _expire_stale_ipv6(profile.id, now)
+    db.session.commit()
+
+    logger.info(
+        "IPv6 '%s': %d vizinho(s), %d anexado(s) a ativos, %d endereço(s) novo(s), "
+        "%d sem device correspondente.",
+        profile.name, stats["neighbors"], stats["attached"],
+        stats["new_addresses"], stats["unmatched"],
+    )
+    return stats
 
 
 def dedupe_device_ips(profile_id: int | None = None) -> dict:
@@ -782,75 +1294,9 @@ def run_host_discovery(profile_id: int):
                 # mesmo que reapareça em outro range ou pelo suplemento ARP.
                 seen_device_ids.add(device.id)
 
-                # Detecção de conflito de IP: outro device do mesmo perfil já usa
-                # este IP como current → dois MACs distintos reivindicando o mesmo IP.
-                conflict_dip = (
-                    DeviceIp.query
-                    .join(Device, DeviceIp.device_id == Device.id)
-                    .filter(
-                        DeviceIp.ip == host.ip,
-                        DeviceIp.is_current.is_(True),
-                        Device.profile_id == profile.id,
-                        Device.id != device.id,
-                    )
-                    .first()
-                )
-                if conflict_dip:
-                    conflict_dev = db.session.get(Device, conflict_dip.device_id)
-                    conflict_mac = conflict_dev.mac if conflict_dev else "?"
-
-                    # Suspeita de ARP spoofing: o dono anterior do IP foi visto
-                    # online há pouco — improvável reuso DHCP; provável outro
-                    # host respondendo ARP por um IP que não é dele.
-                    from flask import current_app
-                    online_minutes = current_app.config.get("HOST_ONLINE_THRESHOLD_MINUTES", 70)
-                    spoof_suspect = bool(
-                        conflict_dev
-                        and conflict_dev.last_seen_at
-                        and conflict_dev.last_seen_at >= now - timedelta(minutes=online_minutes)
-                    )
-                    conflict_type = AlertType.ARP_SPOOFING if spoof_suspect else AlertType.IP_CONFLICT
-
-                    # Dedupe pelo IP na mensagem. O espaço à direita é obrigatório:
-                    # sem ele "192.168.1.1" casaria como substring de
-                    # "192.168.1.10"/"192.168.1.100" e suprimiria um conflito real
-                    # em outro IP. Ambas as mensagens (spoofing e conflito) trazem
-                    # "{host.ip} " logo no início, então o delimitador é seguro.
-                    already_open = Alert.query.filter_by(
-                        profile_id=profile.id,
-                        alert_type=conflict_type,
-                    ).filter(
-                        Alert.message.contains(f"{host.ip} "),
-                        Alert.acknowledged_at.is_(None),
-                    ).first()
-                    if not already_open:
-                        if spoof_suspect:
-                            emit_alert(
-                                profile.id, device.id, AlertType.ARP_SPOOFING,
-                                Severity.CRITICAL,
-                                (
-                                    f"Possível ARP spoofing: {host.ip} respondido por {mac} "
-                                    f"enquanto o dono recente {conflict_mac} "
-                                    f"({conflict_dev.display_name}) ainda estava online"
-                                ),
-                                match_value=host.ip, is_priority=True,
-                                notify_profile=profile, notify_device=device,
-                            )
-                        else:
-                            emit_alert(
-                                profile.id, device.id, AlertType.IP_CONFLICT,
-                                Severity.WARNING,
-                                (
-                                    f"Conflito de IP: {host.ip} reivindicado por "
-                                    f"{mac} e {conflict_mac} simultaneamente"
-                                ),
-                                match_value=host.ip,
-                                notify_profile=profile, notify_device=device,
-                            )
-                        logger.warning(
-                            "Conflito de IP %s entre %s e %s (spoofing=%s)",
-                            host.ip, mac, conflict_mac, spoof_suspect,
-                        )
+                # Detecção de conflito de IP / spoofing — mesma checagem
+                # aplicada à descoberta passiva e ao IPv6 (ver check_ip_claim).
+                check_ip_claim(profile, device, host.ip, now)
 
                 # Gerencia DeviceIp (multi-IP ciente: roteadores/gateways com o
                 # mesmo MAC em várias redes mantêm todos os IPs como atuais).
@@ -862,6 +1308,19 @@ def run_host_discovery(profile_id: int):
             # scan e os outros jobs, que rodam em threads paralelas, batem em
             # "database is locked".
             db.session.commit()
+
+        # Descoberta IPv6 (NDP) — roda uma vez por ciclo, não por range: a
+        # vizinhança IPv6 é escopada por enlace, não por CIDR, e um /64 tem
+        # 2^64 endereços (varredura sequencial é inviável). Os endereços
+        # encontrados são agrupados nos ativos existentes pelo MAC.
+        ipv6_stats = {}
+        try:
+            ipv6_stats = discover_ipv6_for_profile(profile)
+            # Um ativo alcançável só por IPv6 conta como online no snapshot.
+            seen_device_ids |= ipv6_stats.get("online_device_ids", set())
+        except Exception:
+            db.session.rollback()
+            logger.exception("Erro na descoberta IPv6 (profile %d)", profile_id)
 
         # Marca resultado no banco
         scan.finished_at = _utcnow()
@@ -879,6 +1338,14 @@ def run_host_discovery(profile_id: int):
             scan.status = ScanStatus.SUCCESS
             logger.info("Host discovery concluído para '%s': %d hosts.", profile.name, total_hosts)
 
+        if ipv6_stats.get("neighbors"):
+            scan.result_summary = (
+                f"IPv6: {ipv6_stats['neighbors']} vizinho(s), "
+                f"{ipv6_stats['attached']} anexado(s) a ativos, "
+                f"{ipv6_stats['new_addresses']} endereço(s) novo(s), "
+                f"{ipv6_stats['unmatched']} sem device correspondente."
+            )
+
         # Registra snapshot de dispositivos online para histórico do gráfico
         snapshot = DeviceOnlineSnapshot(
             profile_id=profile.id,
@@ -894,6 +1361,18 @@ def run_host_discovery(profile_id: int):
             _check_ghost_devices(profile)
         except Exception:
             logger.exception("Erro na detecção de devices fantasma (profile %d)", profile_id)
+
+        # Integridade do gateway padrão: se o MAC para onde o tráfego de saída
+        # é entregue mudou, ou o roteador foi trocado ou alguém assumiu o lugar
+        # dele. Só leitura de 'ip route' + tabelas de vizinhança — sem tráfego.
+        try:
+            from flask import current_app
+            from app.scanner.mitm import check_gateway_integrity, is_mitm_detection_enabled
+            if is_mitm_detection_enabled(current_app):
+                check_gateway_integrity(profile)
+        except Exception:
+            db.session.rollback()
+            logger.exception("Erro na verificação de gateway (profile %d)", profile_id)
 
     except Exception as e:
         # Rollback antes de tocar na sessão: se o erro veio de um flush (ex.:
@@ -1078,6 +1557,9 @@ def _build_scan_tasks_for_profile(profile_id: int) -> list[dict]:
         .filter(
             Device.profile_id == profile_id,
             DeviceIp.is_current.is_(True),
+            # Só IPv4: o pipeline de port scan padrão usa nmap sem -6. O IPv6
+            # dos mesmos ativos é varrido por run_ipv6_port_scan.
+            DeviceIp.ip_version == 4,
             Device.last_seen_at >= seen_cutoff,
             # Inclui apenas devices não escaneados nas últimas 24h
             db.or_(
@@ -1392,6 +1874,13 @@ def run_port_scan(profile_id: int):
                 found_map = {(p.protocol, p.port): p for p in found_ports}
                 found_set = set(found_map.keys())
 
+                # Toda porta vista agora zera seu contador de misses parciais:
+                # a carência de fechamento recomeça limpa na próxima ausência.
+                if found_set:
+                    with _port_scan_retry_lock:
+                        for _proto, _port_num in found_set:
+                            _port_miss_counts.pop((device_id, _proto, _port_num), None)
+
                 # Conjunto atual de portas no banco (não fechadas)
                 existing_ports = Port.query.filter_by(device_id=device_id).filter(
                     Port.last_seen_closed_at.is_(None)
@@ -1495,14 +1984,36 @@ def run_port_scan(profile_id: int):
                     with _port_scan_retry_lock:
                         _port_scan_bug_attempts.pop(device_id, None)
                         _port_scan_retry_args.pop(device_id, None)
-                    # Cenário normal: marca portas que desapareceram como fechadas.
+                    # Cenário normal: marca portas que desapareceram como
+                    # fechadas — mas com tolerância a perda PARCIAL transitória.
+                    # Uma porta só fecha após _PORT_CLOSE_MISS_THRESHOLD scans
+                    # consecutivos sem vê-la; antes disso mantemos aberta (o miss
+                    # é provavelmente ruído: perda de pacote / firewall momentâneo).
+                    # Exceção: quando desistimos do bug de portas sumidas
+                    # (gave_up_on_bug), as variantes de scan alternativo já deram a
+                    # carência — aí fechamos direto.
                     for key in (old_set - found_set):
                         proto, port_num = key
                         p = Port.query.filter_by(
                             device_id=device_id, protocol=proto, port=port_num
                         ).first()
-                        if p:
+                        if not p:
+                            continue
+                        miss_key = (device_id, proto, port_num)
+                        with _port_scan_retry_lock:
+                            misses = _port_miss_counts.get(miss_key, 0) + 1
+                            _port_miss_counts[miss_key] = misses
+                        if gave_up_on_bug or misses >= _PORT_CLOSE_MISS_THRESHOLD:
                             p.last_seen_closed_at = now
+                            with _port_scan_retry_lock:
+                                _port_miss_counts.pop(miss_key, None)
+                        else:
+                            logger.info(
+                                "Port scan %s (%s): %s/%d ausente (miss %d/%d) — "
+                                "mantendo aberta (perda provavelmente transitória).",
+                                device_display, ip_str, proto, port_num,
+                                misses, _PORT_CLOSE_MISS_THRESHOLD,
+                            )
 
                 # --- Portas que continuam visíveis ---
                 for key in (old_set & found_set):
@@ -1533,6 +2044,12 @@ def run_port_scan(profile_id: int):
                                 match_value=f"{proto}/{port_num}", notify_profile=profile,
                             )
                         p.state = pi.state
+                        # Antes de sobrescrever o banner: mudança de
+                        # serviço/versão numa porta estável é sinal próprio.
+                        _check_service_change(
+                            profile.id, device_id, device_display, ip_str, p, pi,
+                            notify_profile=profile,
+                        )
                         if pi.service_version:
                             p.service_version = pi.service_version
                         if pi.service_name:
@@ -1619,6 +2136,135 @@ def _severity_for_port(port_num: int) -> "Severity":
     return Severity.CRITICAL if port_num in _CRITICAL_PORTS else Severity.WARNING
 
 
+def upsert_vulnerability_row(
+    device_id: int, script_name: str, port: int, protocol: str, service: str,
+    output: str, is_vulnerable: bool, now,
+) -> bool:
+    """Upsert de uma linha ``Vulnerability``, sem emitir alerta.
+
+    Núcleo compartilhado entre o scan NSE sob demanda (``--script=vuln``) e as
+    checagens de configuração de ``app/scanner/hardening.py``: as duas precisam
+    da mesma lógica de reabrir/resolver, mas emitem alertas de tipo e mensagem
+    diferentes — por isso o alerta fica com o chamador.
+
+    Returns:
+        True quando é achado **novo** (linha inédita, ou transição de
+        não-vulnerável/resolvido para vulnerável). É a condição de alerta: um
+        re-scan de algo já conhecido não deve alertar de novo.
+    """
+    from app.extensions import db
+    from app.models import Vulnerability
+
+    existing = Vulnerability.query.filter_by(
+        device_id=device_id, script_name=script_name,
+        port=port, protocol=protocol or "",
+    ).first()
+
+    if existing is None:
+        db.session.add(Vulnerability(
+            device_id=device_id, port=port, protocol=protocol or "",
+            service=service or "", script_name=script_name, output=output,
+            is_vulnerable=is_vulnerable, found_at=now, last_seen_at=now,
+        ))
+        return is_vulnerable
+
+    newly_vulnerable = is_vulnerable and (
+        not existing.is_vulnerable or existing.resolved_at is not None
+    )
+    existing.last_seen_at = now
+    existing.output = output
+    if is_vulnerable:
+        existing.resolved_at = None
+    elif existing.is_vulnerable:
+        # Transição vulnerável → não detectada: marca como resolvida.
+        existing.resolved_at = now
+    existing.is_vulnerable = is_vulnerable
+    return newly_vulnerable
+
+
+def _check_service_change(
+    profile_id: int, device_id: int, device_display: str, ip_str: str,
+    port_row, pi, notify_profile=None,
+) -> bool:
+    """Alerta quando o serviço/versão de uma porta já mapeada muda.
+
+    O que o banner do ``-sV`` diz sobre uma porta é uma assinatura razoavelmente
+    estável do que está rodando ali. Quando ela muda há três explicações, todas
+    dignas de nota: atualização legítima (a mais comum — e é a confirmação de
+    que o patch foi aplicado), troca de equipamento reaproveitando o IP, ou um
+    serviço diferente ocupando a porta depois de um comprometimento.
+
+    **Chamar antes** de gravar os novos valores em ``port_row``.
+
+    Só compara quando os dois lados têm valor: scans sem ``-sV``
+    (``critical_ports_check``) devolvem banner vazio, e o upsert nem sobrescreve
+    nesse caso — comparar contra vazio geraria "mudou para nada" a cada ciclo.
+
+    Porta no baseline (``is_authorized``) **não** suprime este alerta, ao
+    contrário dos de NEW_PORT: autorizar uma porta declara que ela *pode estar
+    aberta*, não que qualquer software pode atender nela. A mudança de versão é
+    justamente o desvio do baseline.
+
+    Returns: True se emitiu alerta.
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Alert, AlertType, Severity
+
+    from app.security_settings import is_service_change_enabled
+
+    try:
+        if not is_service_change_enabled():
+            return False
+        hours = int(current_app.config.get("SERVICE_CHANGE_DEDUP_HOURS", 24))
+    except RuntimeError:
+        return False
+
+    old_name = (port_row.service_name or "").strip()
+    old_version = (port_row.service_version or "").strip()
+    new_name = (pi.service_name or "").strip()
+    new_version = (pi.service_version or "").strip()
+
+    changes = []
+    if new_name and old_name and new_name != old_name:
+        changes.append(f"serviço '{old_name}' -> '{new_name}'")
+    if new_version and old_version and new_version != old_version:
+        changes.append(f"versão '{old_version}' -> '{new_version}'")
+    if not changes:
+        return False
+
+    proto, port_num = port_row.protocol, port_row.port
+
+    if hours > 0:
+        cutoff = _utcnow() - timedelta(hours=hours)
+        recent = db.session.query(Alert.id).filter(
+            Alert.device_id == device_id,
+            Alert.alert_type == AlertType.SERVICE_CHANGED,
+            Alert.match_value == f"{proto}/{port_num}",
+            Alert.created_at >= cutoff,
+        ).first()
+        if recent:
+            return False
+
+    location = f"{device_display} ({ip_str})" if ip_str else device_display
+    alert = emit_alert(
+        profile_id, device_id, AlertType.SERVICE_CHANGED, Severity.WARNING,
+        (
+            f"Serviço mudou em {location}: {proto}/{port_num} — "
+            + "; ".join(changes)
+            + ". Confirme se foi uma atualização planejada."
+        ),
+        match_value=f"{proto}/{port_num}", notify_profile=notify_profile,
+    )
+    if alert is not None:
+        logger.info(
+            "SERVICE_CHANGED em %s %s/%d: %s", ip_str or device_display,
+            proto, port_num, "; ".join(changes),
+        )
+    return alert is not None
+
+
 def _recent_port_alert_exists(device_id: int, proto: str, port_num: int) -> bool:
     """Dedupe de alertas de porta: já existe alerta NEW_PORT para este
     device+porta dentro da janela PORT_ALERT_DEDUP_HOURS?
@@ -1688,6 +2334,10 @@ def _record_detected_open_port(
         port_row.last_seen_open_at = now
         port_row.last_seen_closed_at = None
         port_row.state = pi.state
+        _check_service_change(
+            profile.id, device_id, device_display, ip_str, port_row, pi,
+            notify_profile=profile,
+        )
         if pi.service_name:
             port_row.service_name = pi.service_name
         if pi.service_version:
@@ -1729,6 +2379,8 @@ def _online_devices_with_ip(profile_id: int, exclude_passive: bool = True):
         .filter(
             Device.profile_id == profile_id,
             DeviceIp.is_current.is_(True),
+            # Checks auxiliares (portas críticas, UDP) usam nmap IPv4.
+            DeviceIp.ip_version == 4,
             Device.last_seen_at >= cutoff,
         )
         .order_by(DeviceIp.last_seen_at.desc())
@@ -1946,25 +2598,378 @@ def run_udp_scan(profile_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Job: Port scan sobre IPv6
+# ---------------------------------------------------------------------------
+
+# Prefixo de protocolo das portas descobertas via IPv6. Portas IPv4 e IPv6 do
+# mesmo ativo são registros distintos (a constraint única de Port já é
+# (device_id, protocol, port)), porque são de fato superfícies distintas: é
+# comum uma porta estar fechada no IPv4 e aberta no IPv6 por divergência nas
+# regras de firewall — que é justamente o que este job existe para revelar.
+_IPV6_PROTO_SUFFIX = "6"
+_IPV6_PROTOCOLS = ("tcp6", "udp6")
+
+
+def _ipv6_proto(protocol: str) -> str:
+    """'tcp' -> 'tcp6'. Mantém o que já vier marcado como IPv6."""
+    protocol = (protocol or "tcp").lower()
+    if protocol.endswith(_IPV6_PROTO_SUFFIX):
+        return protocol
+    return protocol + _IPV6_PROTO_SUFFIX
+
+
+def _online_devices_with_ipv6(profile_id: int, exclude_passive: bool = True):
+    """[(Device, DeviceIp)] dos devices online com IPv6 roteável (global/ULA).
+
+    Link-local fica de fora: depende de zone id e de interface de saída, o que
+    o nmap não resolve de forma confiável em varredura em lote.
+
+    Respeita ``passive_only``: se o IPv4 atual do ativo está numa faixa marcada
+    como somente-passiva, o IPv6 dele também não é escaneado — a intenção do
+    operador é não gerar tráfego ativo contra aquele equipamento, e a família
+    de endereços não muda isso.
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Device, DeviceIp
+    from app.scanner.hosts6 import is_routable_ipv6
+
+    online_minutes = current_app.config.get("HOST_ONLINE_THRESHOLD_MINUTES", 70)
+    cutoff = _utcnow() - timedelta(minutes=online_minutes)
+    rows = (
+        db.session.query(Device, DeviceIp)
+        .join(DeviceIp, Device.id == DeviceIp.device_id)
+        .filter(
+            Device.profile_id == profile_id,
+            DeviceIp.is_current.is_(True),
+            DeviceIp.ip_version == 6,
+            Device.last_seen_at >= cutoff,
+        )
+        .order_by(DeviceIp.last_seen_at.desc())
+        .all()
+    )
+
+    # Um device com vários IPv6 atuais (global + temporários) é escaneado uma
+    # única vez, no endereço roteável visto mais recentemente.
+    seen_ids: set[int] = set()
+    deduped = []
+    for device, dip in rows:
+        if device.id in seen_ids or not is_routable_ipv6(dip.ip):
+            continue
+        seen_ids.add(device.id)
+        deduped.append((device, dip))
+
+    if not exclude_passive or not deduped:
+        return deduped
+
+    from app.models import IpRange
+    enabled_ranges = IpRange.query.filter_by(profile_id=profile_id, enabled=True).all()
+    passive_nets = _passive_only_nets(enabled_ranges)
+    if not passive_nets:
+        return deduped
+    return [
+        (d, dip) for d, dip in deduped
+        if not any(_ip_is_passive_only(ip, passive_nets) for ip in d.current_ipv4s)
+    ]
+
+
+def run_ipv6_port_scan(profile_id: int):
+    """Escaneia as portas do perfil sobre o IPv6 global/ULA dos ativos online.
+
+    Existe porque as regras de firewall costumam divergir entre as duas
+    famílias: um host pode ter a porta 3389 bloqueada no IPv4 e completamente
+    exposta no IPv6, e um monitor que só olha IPv4 nunca veria isso.
+
+    As portas ficam registradas com protocolo ``tcp6``/``udp6``, separadas das
+    IPv4 do mesmo ativo. O fechamento usa a mesma carência de dois misses
+    consecutivos do ``run_port_scan`` (``_PORT_CLOSE_MISS_THRESHOLD``), para
+    não fechar e re-alertar portas por causa de uma perda pontual.
+    """
+    from app.extensions import db
+    from app.models import Port, Profile, Scan, ScanStatus, ScanType
+    from app.ipv6_settings import is_ipv6_port_scan_enabled
+    from app.scanner.hosts6 import is_host_reachable6
+    from app.scanner.ports import DEFAULT_PORTS, get_actionable_ports, scan_ports_for_host
+
+    from flask import current_app
+    if not is_ipv6_port_scan_enabled(current_app):
+        logger.debug("Port scan IPv6 desabilitado — ignorando (profile %d).", profile_id)
+        return
+
+    profile = db.session.get(Profile, profile_id)
+    if not profile or not profile.is_active:
+        return
+
+    rows = _online_devices_with_ipv6(profile_id)
+    if not rows:
+        logger.info("Port scan IPv6 '%s': nenhum ativo online com IPv6 roteável.", profile.name)
+        return
+
+    ports_csv = (profile.default_ports or "").strip() or DEFAULT_PORTS
+    timeout_args = "--host-timeout 300s"
+    if _has_root():
+        nmap_args = f"-6 -Pn -sS -sV -T4 --version-intensity 2 {timeout_args}"
+    else:
+        nmap_args = f"-6 -Pn -sT -sV -T4 --version-intensity 2 {timeout_args}"
+
+    tasks = [
+        {"device_id": d.id, "device_display": d.display_name, "ip": dip.ip}
+        for d, dip in rows
+    ]
+
+    scan_start = _utcnow()
+    alerts_emitted = 0
+    open_found = 0
+    closed_count = 0
+    max_workers = max(1, profile.max_concurrent_scans)
+
+    def _scan_one(task):
+        # Confirma vida antes de escanear: com -Pn o nmap devolve host_found
+        # mesmo para host ausente, e as portas mapeadas seriam contadas como
+        # miss indevidamente.
+        is_up, _method = is_host_reachable6(task["ip"], deep=True)
+        if not is_up:
+            return task, [], False
+        port_list, host_found = scan_ports_for_host(
+            task["ip"], ports=ports_csv, arguments=nmap_args,
+        )
+        return task, port_list, host_found
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for task in tasks:
+                futures.append(executor.submit(_scan_one, task))
+                time.sleep(0.3)
+
+            for future in futures:
+                try:
+                    task, port_results, host_found = future.result(timeout=600)
+                except Exception:
+                    logger.exception("Erro no port scan IPv6 de um device")
+                    continue
+                if not host_found:
+                    continue  # host sumiu: preserva o estado atual das portas
+
+                device_id = task["device_id"]
+                now = _utcnow()
+
+                # Reetiqueta o protocolo antes de gravar: o nmap reporta "tcp"
+                # mesmo com -6, e sem isso a porta IPv6 sobrescreveria a IPv4.
+                actionable = get_actionable_ports(port_results)
+                for pi in actionable:
+                    pi.protocol = _ipv6_proto(pi.protocol)
+
+                found_keys = {(pi.protocol, pi.port) for pi in actionable}
+                for pi in actionable:
+                    if pi.state == "open":
+                        open_found += 1
+                    if _record_detected_open_port(
+                        profile, device_id, task["device_display"],
+                        task["ip"], pi, now, source="scan IPv6",
+                    ):
+                        alerts_emitted += 1
+
+                # Fechamento com carência de dois misses consecutivos.
+                mapped = (
+                    Port.query
+                    .filter(
+                        Port.device_id == device_id,
+                        Port.protocol.in_(_IPV6_PROTOCOLS),
+                        Port.last_seen_closed_at.is_(None),
+                    )
+                    .all()
+                )
+                for row in mapped:
+                    miss_key = (device_id, row.protocol, row.port)
+                    if (row.protocol, row.port) in found_keys:
+                        with _port_scan_retry_lock:
+                            _port_miss_counts.pop(miss_key, None)
+                        continue
+                    with _port_scan_retry_lock:
+                        misses = _port_miss_counts.get(miss_key, 0) + 1
+                        _port_miss_counts[miss_key] = misses
+                    if misses >= _PORT_CLOSE_MISS_THRESHOLD:
+                        row.last_seen_closed_at = now
+                        closed_count += 1
+                        with _port_scan_retry_lock:
+                            _port_miss_counts.pop(miss_key, None)
+                    else:
+                        logger.info(
+                            "Porta IPv6 %s/%d de device %d ausente (%d/%d) — "
+                            "aguardando confirmação antes de fechar.",
+                            row.protocol, row.port, device_id,
+                            misses, _PORT_CLOSE_MISS_THRESHOLD,
+                        )
+
+                db.session.commit()
+
+        db.session.add(Scan(
+            profile_id=profile.id,
+            scan_type=ScanType.PORT_SCAN,
+            target_ip=None,
+            started_at=scan_start,
+            finished_at=_utcnow(),
+            hosts_found=len(tasks),
+            status=ScanStatus.SUCCESS,
+            result_summary=(
+                f"Scan IPv6: {len(tasks)} ativo(s), {open_found} porta(s) aberta(s), "
+                f"{closed_count} fechada(s), {alerts_emitted} alerta(s)."
+            ),
+        ))
+        db.session.commit()
+        logger.info(
+            "Port scan IPv6 '%s': %d ativos, %d portas abertas, %d fechadas, %d alertas.",
+            profile.name, len(tasks), open_found, closed_count, alerts_emitted,
+        )
+    except Exception:
+        db.session.rollback()
+        logger.exception("Erro no port scan IPv6 (profile %d)", profile_id)
+
+
+# ---------------------------------------------------------------------------
 # Job: Verificação de certificados TLS
 # ---------------------------------------------------------------------------
 
-def _fetch_cert_not_after(ip: str, port: int, timeout: int = 8):
-    """Conecta na porta TLS e retorna (not_after_utc_naive, subject_str).
+# Versões de protocolo consideradas obsoletas. TLS 1.0 e 1.1 foram
+# formalmente depreciados pela RFC 8996 (2021): MAC baseado em SHA-1/MD5,
+# vulneráveis a BEAST/POODLE e sem AEAD.
+_OBSOLETE_TLS_VERSIONS = ("SSLv2", "SSLv3", "TLSv1", "TLSv1.1")
 
-    Lança exceção em falha de conexão/handshake — o chamador decide ignorar.
-    Não valida a cadeia (queremos ler o cert mesmo se self-signed).
+# Hashes de assinatura com colisão prática demonstrada — um certificado
+# assinado com eles pode ser forjado.
+_BROKEN_SIG_HASHES = ("md5", "sha1")
+
+# Piso de tamanho de chave por tipo de algoritmo.
+_MIN_KEY_BITS = {"RSA": 2048, "DSA": 2048, "EC": 224}
+
+
+def _permissive_tls_context():
+    """Contexto SSL que aceita protocolos antigos e não valida a cadeia.
+
+    Dois motivos para não usar ``create_default_context()``:
+
+    1. O padrão do Python recusa handshake abaixo de TLS 1.2 — contra um
+       servidor legado o resultado seria uma exceção de conexão, e nós
+       perderíamos tanto o certificado quanto a informação de que ele é legado.
+    2. Não validamos a cadeia de propósito: praticamente todo equipamento de
+       rede usa certificado autoassinado, e queremos *ler* esse certificado para
+       avaliá-lo, não rejeitá-lo.
+
+    Isto é um **inspetor**, não um cliente: nada sensível trafega por esta
+    conexão.
+    """
+    import ssl
+    import warnings
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        # As constantes de protocolo antigo são deprecadas justamente por não
+        # serem seguras — e é por isso que precisamos delas aqui: sem baixar o
+        # piso não há como *descobrir* que o servidor só fala protocolo velho.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            ctx.minimum_version = ssl.TLSVersion.SSLv3
+    except (ValueError, AttributeError):
+        pass
+    # SECLEVEL=0 libera os ciphers antigos que o OpenSSL desabilita por padrão.
+    # Sem isso o handshake com um servidor legado falha antes de mostrar o cert.
+    for ciphers in ("ALL:@SECLEVEL=0", "ALL:@SECLEVEL=1", "DEFAULT"):
+        try:
+            ctx.set_ciphers(ciphers)
+            break
+        except ssl.SSLError:
+            continue
+    return ctx
+
+
+def _public_key_type(cert) -> str:
+    """Nome do algoritmo da chave pública do certificado ('RSA', 'EC', ...)."""
+    from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+
+    try:
+        pub = cert.public_key()
+    except Exception:
+        return ""
+    if isinstance(pub, rsa.RSAPublicKey):
+        return "RSA"
+    if isinstance(pub, ec.EllipticCurvePublicKey):
+        return "EC"
+    if isinstance(pub, dsa.DSAPublicKey):
+        return "DSA"
+    return type(pub).__name__.replace("PublicKey", "")
+
+
+def _public_key_bits(cert) -> int:
+    """Tamanho da chave pública em bits (0 quando não aplicável/desconhecido)."""
+    try:
+        pub = cert.public_key()
+    except Exception:
+        return 0
+    bits = getattr(pub, "key_size", None)
+    if bits:
+        return int(bits)
+    curve = getattr(pub, "curve", None)
+    return int(getattr(curve, "key_size", 0) or 0)
+
+
+def _legacy_tls_accepted(ip: str, port: int, timeout: int = 5) -> bool:
+    """O servidor ainda fecha handshake limitado a TLS 1.1 ou inferior?
+
+    A conexão principal negocia a versão **mais alta** que ambos suportam, então
+    um servidor que fala TLS 1.3 aparece como moderno mesmo continuando a aceitar
+    TLS 1.0 de quem pedir. Só um handshake com teto em 1.1 revela isso — e é o
+    que interessa: enquanto o protocolo antigo estiver aceito, um cliente
+    (ou um atacante forçando downgrade) consegue usá-lo.
+
+    Uma conexão extra por porta TLS a cada 24h. Falha de rede devolve False:
+    na dúvida, não acusamos.
     """
     import socket
     import ssl
+    import warnings
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = _permissive_tls_context()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_1
+    except (ValueError, AttributeError):
+        return False
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock) as ssock:
+                return bool(ssock.version())
+    except Exception:
+        return False
 
+
+def _fetch_cert_info(ip: str, port: int, timeout: int = 8):
+    """Conecta na porta TLS e lê o certificado apresentado.
+
+    Lança exceção em falha de conexão/handshake — o chamador decide ignorar.
+    Não valida a cadeia (queremos ler o cert mesmo se self-signed).
+
+    Returns:
+        dict com ``not_after`` (UTC naive), ``subject``, ``issuer`` e
+        ``fingerprint`` (SHA-256 do DER, hex). O fingerprint é o que permite
+        perceber que o certificado *trocou* — rastro de um proxy TLS de
+        interceptação se colocando no meio da conexão.
+    """
+    import hashlib
+    import socket
+
+    ctx = _permissive_tls_context()
+
+    # IPv6 exige AF_INET6; create_connection resolve a família sozinho.
     with socket.create_connection((ip, port), timeout=timeout) as sock:
         with ctx.wrap_socket(sock) as ssock:
             der = ssock.getpeercert(binary_form=True)
+            negotiated = ssock.version() or ""
+            cipher = ssock.cipher() or ("", "", 0)
 
     from cryptography import x509
 
@@ -1980,7 +2985,175 @@ def _fetch_cert_not_after(ip: str, port: int, timeout: int = 8):
         subject = cert.subject.rfc4514_string()
     except Exception:
         subject = ""
-    return not_after, subject
+    try:
+        issuer = cert.issuer.rfc4514_string()
+    except Exception:
+        issuer = ""
+    # Algoritmo de assinatura do certificado. Ed25519/Ed448 não têm hash
+    # separado (o atributo vem None) — isso é moderno, não uma fraqueza.
+    try:
+        sig_hash = (cert.signature_hash_algorithm.name or "").lower()
+    except Exception:
+        sig_hash = ""
+
+    return {
+        "not_after": not_after,
+        "subject": subject,
+        "issuer": issuer,
+        "fingerprint": hashlib.sha256(der).hexdigest(),
+        "protocol": negotiated,
+        "cipher": cipher[0],
+        "self_signed": cert.issuer == cert.subject,
+        "sig_hash": sig_hash,
+        "key_type": _public_key_type(cert),
+        "key_bits": _public_key_bits(cert),
+    }
+
+
+def _check_cert_identity_change(profile, device, port_row, info, now) -> bool:
+    """Compara o certificado lido com o que estava gravado na porta.
+
+    Renovação de rotina troca a impressão digital mantendo o emissor — comum e
+    esperado (Let's Encrypt renova a cada 90 dias), então isso é WARNING. Já a
+    troca de **emissor** junto com a impressão é o rastro típico de interceptação
+    TLS: o proxy assina com uma CA própria. Esse caso é CRITICAL e prioritário.
+
+    Na primeira leitura apenas grava o baseline.
+
+    Returns: True se emitiu alerta.
+    """
+    from app.models import AlertType, Severity
+
+    fingerprint = info["fingerprint"]
+    issuer = info["issuer"] or ""
+    known_fp = port_row.tls_fingerprint
+    known_issuer = port_row.tls_issuer or ""
+
+    port_row.tls_fingerprint = fingerprint
+    port_row.tls_issuer = issuer
+
+    if not known_fp or known_fp == fingerprint:
+        return False
+
+    issuer_changed = bool(known_issuer) and known_issuer != issuer
+    ip = device.current_ip or "?"
+    if issuer_changed:
+        message = (
+            f"Certificado TLS de {device.display_name} ({ip}:{port_row.port}) "
+            f"trocou de emissor: '{known_issuer}' -> '{issuer}'. "
+            "Troca de emissor com nova impressão digital é o rastro típico de "
+            "um proxy de interceptação TLS (man-in-the-middle)."
+        )
+        severity, priority = Severity.CRITICAL, True
+    else:
+        message = (
+            f"Certificado TLS de {device.display_name} ({ip}:{port_row.port}) "
+            f"mudou (impressão {known_fp[:16]}… -> {fingerprint[:16]}…), "
+            f"mesmo emissor '{issuer}'. Provável renovação de rotina."
+        )
+        severity, priority = Severity.WARNING, False
+
+    alert = emit_alert(
+        profile.id if profile else device.profile_id, device.id,
+        AlertType.TLS_CERT_CHANGED, severity, message,
+        match_value=f"tcp/{port_row.port}", is_priority=priority,
+        notify_profile=profile, notify_device=device,
+    )
+    if alert is not None:
+        logger.warning(
+            "TLS_CERT_CHANGED em %s:%d (emissor mudou=%s)",
+            ip, port_row.port, issuer_changed,
+        )
+    return alert is not None
+
+
+def _check_tls_quality(profile, device, port_row, info, now) -> bool:
+    """Avalia a configuração TLS do serviço e alerta em achados de fraqueza.
+
+    Complementa a checagem de expiração: um certificado pode estar perfeitamente
+    válido e ainda assim ser assinado com SHA-1, ter chave RSA de 1024 bits ou
+    estar servido por uma pilha que aceita TLS 1.0. São achados de
+    *configuração*, não de ataque em curso — por isso nunca passam de WARNING,
+    ao contrário de TLS_CERT_CHANGED.
+
+    O certificado autoassinado é reportado separadamente, como INFO: numa LAN é
+    a regra, não a exceção (roteador, impressora, NAS e câmera vêm assim de
+    fábrica). Vale registrar — é o que impede distinguir o serviço legítimo de
+    um impostor — mas não merece o mesmo peso.
+
+    Dedupe por mensagem dentro de ``TLS_QUALITY_RECHECK_DAYS``: um achado de
+    configuração não muda sozinho, e re-alertar todo dia só treina o operador a
+    ignorar. Se o conjunto de achados mudar, a mensagem muda e o alerta sai.
+
+    Returns: True se emitiu alerta.
+    """
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import Alert, AlertType, Severity
+
+    findings: list[str] = []
+    severe = False  # achado que sobe de INFO para WARNING
+
+    protocol = (info.get("protocol") or "").strip()
+    if protocol in _OBSOLETE_TLS_VERSIONS:
+        findings.append(f"melhor protocolo negociado é {protocol} (obsoleto, RFC 8996)")
+        severe = True
+    elif info.get("legacy_accepted"):
+        findings.append(
+            f"aceita TLS 1.1 ou inferior além de {protocol or 'versões atuais'}"
+        )
+        severe = True
+
+    sig_hash = info.get("sig_hash") or ""
+    if sig_hash in _BROKEN_SIG_HASHES:
+        findings.append(f"certificado assinado com {sig_hash.upper()} (colisão prática)")
+        severe = True
+
+    key_type = info.get("key_type") or ""
+    key_bits = int(info.get("key_bits") or 0)
+    minimum = _MIN_KEY_BITS.get(key_type)
+    if minimum and key_bits and key_bits < minimum:
+        findings.append(f"chave {key_type} de {key_bits} bits (mínimo recomendado {minimum})")
+        severe = True
+
+    if info.get("self_signed"):
+        findings.append("certificado autoassinado (identidade não verificável)")
+
+    if not findings:
+        return False
+
+    ip = device.current_ip or "?"
+    message = (
+        f"TLS fraco em {device.display_name} ({ip}:{port_row.port}): "
+        + "; ".join(findings) + "."
+    )
+
+    try:
+        days = int(current_app.config.get("TLS_QUALITY_RECHECK_DAYS", 30))
+    except RuntimeError:
+        days = 30
+    if days > 0:
+        cutoff = now - timedelta(days=days)
+        recent = db.session.query(Alert.id).filter(
+            Alert.device_id == device.id,
+            Alert.alert_type == AlertType.WEAK_TLS,
+            Alert.message == message,
+            Alert.created_at >= cutoff,
+        ).first()
+        if recent:
+            return False
+
+    alert = emit_alert(
+        profile.id if profile else device.profile_id, device.id,
+        AlertType.WEAK_TLS,
+        Severity.WARNING if severe else Severity.INFO,
+        message, match_value=f"tcp/{port_row.port}",
+        notify_profile=profile, notify_device=device,
+    )
+    if alert is not None:
+        logger.info("WEAK_TLS em %s:%d — %s", ip, port_row.port, "; ".join(findings))
+    return alert is not None
 
 
 def check_tls_certificates():
@@ -2012,17 +3185,45 @@ def check_tls_certificates():
         .all()
     )
 
+    from app.scanner.mitm import is_mitm_detection_enabled
+    mitm_enabled = is_mitm_detection_enabled(current_app)
+    from app.security_settings import is_tls_quality_enabled
+    quality_enabled = is_tls_quality_enabled(current_app)
+
     checked = alerts = 0
     for port_row, device in rows:
         ip = device.current_ip
         if not ip:
             continue
         try:
-            not_after, subject = _fetch_cert_not_after(ip, port_row.port)
+            info = _fetch_cert_info(ip, port_row.port)
         except Exception as exc:
             logger.debug("TLS check falhou para %s:%d: %s", ip, port_row.port, exc)
             continue
         checked += 1
+        not_after, subject = info["not_after"], info["subject"]
+        profile = db.session.get(Profile, device.profile_id)
+
+        # Identidade do certificado: troca de impressão/emissor indica
+        # interceptação. Independe da expiração, então roda antes do corte.
+        if mitm_enabled:
+            if _check_cert_identity_change(profile, device, port_row, info, _utcnow()):
+                alerts += 1
+
+        # Qualidade da configuração (versão do protocolo, assinatura, chave).
+        # A sonda de protocolo legado é uma conexão extra, então só é feita
+        # quando a avaliação está ligada e o servidor já falou uma versão atual.
+        if quality_enabled:
+            protocol = info.get("protocol") or ""
+            info["legacy_accepted"] = (
+                bool(protocol)
+                and protocol not in _OBSOLETE_TLS_VERSIONS
+                and _legacy_tls_accepted(ip, port_row.port)
+            )
+            if _check_tls_quality(profile, device, port_row, info, _utcnow()):
+                alerts += 1
+
+        db.session.commit()
 
         days_left = (not_after - _utcnow()).days
         if days_left > warn_days:
@@ -2049,7 +3250,6 @@ def check_tls_certificates():
             severity = Severity.WARNING
             status_txt = f"expira em {days_left} dia(s)"
 
-        profile = db.session.get(Profile, device.profile_id)
         alert = emit_alert(
             device.profile_id, device.id, AlertType.TLS_CERT_EXPIRING, severity,
             (
@@ -2259,6 +3459,13 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
         found_map = {(p.protocol, p.port): p for p in found_ports}
         found_set = set(found_map.keys())
 
+        # Toda porta vista zera seu contador de misses parciais (mesmo dict do
+        # scan agendado, ver run_port_scan / _PORT_CLOSE_MISS_THRESHOLD).
+        if found_set:
+            with _port_scan_retry_lock:
+                for _proto, _port_num in found_set:
+                    _port_miss_counts.pop((device.id, _proto, _port_num), None)
+
         existing_open = Port.query.filter_by(device_id=device.id).filter(
             Port.last_seen_closed_at.is_(None)
         ).all()
@@ -2291,11 +3498,27 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
                 )
 
         if host_found:
+            # Perda total (0 portas) já esgotou a sequência alternativa acima —
+            # é fechamento definitivo. Perda PARCIAL usa a mesma carência do scan
+            # agendado: a porta só fecha após _PORT_CLOSE_MISS_THRESHOLD misses
+            # consecutivos, evitando fechar/re-alertar por ruído transitório.
+            close_directly = len(found_set) == 0
             for key in (old_set - found_set):
                 proto, port_num = key
                 p = Port.query.filter_by(device_id=device.id, protocol=proto, port=port_num).first()
-                if p:
+                if not p:
+                    continue
+                if close_directly:
                     p.last_seen_closed_at = now
+                    continue
+                miss_key = (device.id, proto, port_num)
+                with _port_scan_retry_lock:
+                    misses = _port_miss_counts.get(miss_key, 0) + 1
+                    _port_miss_counts[miss_key] = misses
+                if misses >= _PORT_CLOSE_MISS_THRESHOLD:
+                    p.last_seen_closed_at = now
+                    with _port_scan_retry_lock:
+                        _port_miss_counts.pop(miss_key, None)
 
         for key in (old_set & found_set):
             proto, port_num = key
@@ -2317,6 +3540,9 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
                         match_value=f"{proto}/{port_num}",
                     )
                 p.state = pi.state
+                _check_service_change(
+                    device.profile_id, device.id, device.display_name, "", p, pi,
+                )
                 if pi.service_name:
                     p.service_name = pi.service_name
                 if pi.service_version:
@@ -2336,7 +3562,7 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
 
     # --- Vulnerability scan básico (nmap --script=vuln) ---
     if "vuln" in scan_types:
-        from app.models import Profile, Vulnerability
+        from app.models import Profile
         vuln_result = _scan_vulnerabilities(ip)
         results["vuln"] = vuln_result
 
@@ -2344,43 +3570,12 @@ def _run_on_demand_scan_inner(device_id: int, scan_types: list[str]) -> dict:
 
         # Salva vulnerabilidades no banco
         for v in vuln_result.get("vulns", []):
-            is_vulnerable = v.get("is_vulnerable", False)
-            existing = Vulnerability.query.filter_by(
-                device_id=device.id,
-                script_name=v["script"],
-                port=v["port"],
-                protocol=v.get("protocol", ""),
-            ).first()
-            if existing:
-                # Alerta só na transição não-vulnerável → vulnerável (sem spam
-                # em re-scans de algo já conhecido).
-                newly_vulnerable = is_vulnerable and (
-                    not existing.is_vulnerable or existing.resolved_at is not None
-                )
-                existing.last_seen_at = now
-                existing.output = v["output"]
-                if is_vulnerable:
-                    # Voltou (ou segue) vulnerável — reabre.
-                    existing.resolved_at = None
-                elif existing.is_vulnerable:
-                    # Transição vulnerável → não detectada: marca como resolvida
-                    # (antes o resolved_at era zerado incondicionalmente e a
-                    # vulnerabilidade nunca aparecia como resolvida).
-                    existing.resolved_at = now
-                existing.is_vulnerable = is_vulnerable
-            else:
-                newly_vulnerable = is_vulnerable
-                db.session.add(Vulnerability(
-                    device_id=device.id,
-                    port=v["port"],
-                    protocol=v.get("protocol", ""),
-                    service=v.get("service", ""),
-                    script_name=v["script"],
-                    output=v["output"],
-                    is_vulnerable=is_vulnerable,
-                    found_at=now,
-                    last_seen_at=now,
-                ))
+            newly_vulnerable = upsert_vulnerability_row(
+                device_id=device.id, script_name=v["script"], port=v["port"],
+                protocol=v.get("protocol", ""), service=v.get("service", ""),
+                output=v["output"], is_vulnerable=v.get("is_vulnerable", False),
+                now=now,
+            )
 
             # Vulnerabilidade confirmada precisa aparecer na lista de alertas —
             # o card "Vulnerabilidades Abertas" do dashboard conta estas linhas
@@ -3027,6 +4222,9 @@ def _prune_stale_scan_state() -> None:
             removed += 1
         for did in [d for d in _port_scan_bug_attempts if d not in device_ids]:
             del _port_scan_bug_attempts[did]
+            removed += 1
+        for mkey in [k for k in _port_miss_counts if k[0] not in device_ids]:
+            del _port_miss_counts[mkey]
             removed += 1
     with _port_scan_queues_lock:
         for pid in [p for p in _port_scan_queues if p not in active_profile_ids]:

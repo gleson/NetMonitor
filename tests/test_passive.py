@@ -1,4 +1,8 @@
-"""Testes da descoberta passiva (callback do sniffer ARP + multicast)."""
+"""Testes da descoberta passiva (callback do sniffer ARP/NDP + multicast).
+
+O buffer é chaveado por ``(MAC, versão do IP)``: um mesmo ativo fala IPv4 e
+IPv6 ao mesmo tempo e as duas observações precisam sobreviver na mesma janela.
+"""
 
 import pytest
 from scapy.layers.inet import IP, UDP
@@ -26,7 +30,7 @@ def test_arp_packet_bufferizado():
         psrc="192.168.100.62", hwsrc="aa:bb:cc:dd:ee:01", op=1,
     )
     passive._on_packet(pkt)
-    assert _buffer() == {"AA:BB:CC:DD:EE:01": "192.168.100.62"}
+    assert _buffer() == {("AA:BB:CC:DD:EE:01", 4): "192.168.100.62"}
 
 
 def test_mdns_multicast_bufferizado():
@@ -36,7 +40,7 @@ def test_mdns_multicast_bufferizado():
         / UDP(sport=5353, dport=5353)
     )
     passive._on_packet(pkt)
-    assert _buffer() == {"AA:BB:CC:DD:EE:02": "192.168.100.62"}
+    assert _buffer() == {("AA:BB:CC:DD:EE:02", 4): "192.168.100.62"}
 
 
 def test_ssdp_e_broadcast_bufferizados():
@@ -53,8 +57,8 @@ def test_ssdp_e_broadcast_bufferizados():
     passive._on_packet(ssdp)
     passive._on_packet(netbios)
     assert _buffer() == {
-        "AA:BB:CC:DD:EE:03": "192.168.100.70",
-        "AA:BB:CC:DD:EE:04": "192.168.100.71",
+        ("AA:BB:CC:DD:EE:03", 4): "192.168.100.70",
+        ("AA:BB:CC:DD:EE:04", 4): "192.168.100.71",
     }
 
 

@@ -204,13 +204,20 @@ def discover_switch_topology(profile_id: int):
 
     now = _utcnow()
     total = 0
+    # Portas locais com vizinho LLDP: são interligações entre switches, não
+    # tomadas de endpoint. Usadas para descartar uplinks na análise de MAC
+    # duplicado — sem isso, todo MAC da rede apareceria "em dois switches".
+    lldp_ports: set = set()
     for switch, dip in switches:
         ip = dip.ip
         try:
-            found = _collect_lldp_neighbors(ip, cred) + _collect_fdb_entries(ip, cred)
+            lldp = _collect_lldp_neighbors(ip, cred)
+            found = lldp + _collect_fdb_entries(ip, cred)
         except Exception:
             logger.exception("Erro coletando topologia do switch %s (%s)", switch.display_name, ip)
             continue
+        for entry in lldp:
+            lldp_ports.add((switch.id, entry.get("local_port", "")))
 
         for entry in found:
             remote_mac = entry.get("remote_mac", "")
@@ -258,3 +265,209 @@ def discover_switch_topology(profile_id: int):
         "Topologia '%s': %d vizinhança(s) atualizada(s), %d antiga(s) removida(s).",
         profile.name, total, removed,
     )
+
+    # A checagem de MAC duplicado roda sobre o conjunto persistido (todos os
+    # switches do perfil), e não por switch: o sinal forte é justamente o mesmo
+    # endereço aparecer em portas de acesso de switches diferentes.
+    try:
+        anomalies = check_mac_port_anomalies(profile, lldp_ports, now)
+    except Exception:
+        logger.exception("Erro na análise de MAC duplicado do perfil %d.", profile_id)
+    else:
+        if anomalies:
+            logger.info(
+                "Topologia '%s': %d MAC(s) em portas de acesso distintas.",
+                profile.name, len(anomalies),
+            )
+
+
+# ---------------------------------------------------------------------------
+# MAC aprendido em portas de acesso distintas
+# ---------------------------------------------------------------------------
+#
+# A FDB (``dot1dTpFdbPort``) é indexada pelo MAC, então um switch nunca reporta
+# o mesmo MAC em duas portas na mesma leitura — é assim que o encaminhamento
+# funciona. O sinal de clonagem aparece quando se olha o conjunto:
+#
+# 1. **Entre switches** — um MAC aprendido numa porta de *acesso* de dois
+#    switches diferentes. No caminho normal ele aparece na porta de acesso de um
+#    switch e na porta de *uplink* dos demais; duas portas de acesso significam
+#    dois equipamentos respondendo pelo mesmo endereço.
+# 2. **No mesmo switch, alternando** — duas portas com janelas de observação
+#    que se sobrepõem. Mudar de tomada gera janelas *disjuntas* (some de uma,
+#    aparece na outra) e não alerta; oscilação entre as duas gera sobreposição,
+#    que é o rastro de MAC duplicado ou de laço de camada 2.
+#
+# Portas de uplink são identificadas de duas formas, porque nenhuma isolada é
+# confiável: pelo LLDP (o nome da porta local com vizinho switch) e pela
+# contagem de MACs aprendidos (uplink carrega a rede inteira; porta de acesso
+# carrega um ou dois). A segunda cobre o caso comum de o rótulo do LLDP
+# (``lldpLocPortId``) não coincidir com o do ifName usado pela FDB.
+
+_KEY_MAC_PORT_ALERTS = "topology.mac_port_alerts"
+
+
+def is_mac_port_alerts_enabled(app) -> bool:
+    """Flag efetiva do alerta de MAC duplicado (AppSetting > config)."""
+    default = bool(app.config.get("TOPOLOGY_MAC_PORT_ALERTS", True))
+    try:
+        from app.models import AppSetting
+        raw = AppSetting.get_value(_KEY_MAC_PORT_ALERTS, "")
+        if raw == "":
+            return default
+        return raw in ("1", "true", "True", "on", "yes")
+    except Exception:
+        logger.debug("Falha ao ler AppSetting %s — usando default.", _KEY_MAC_PORT_ALERTS,
+                     exc_info=True)
+        return default
+
+
+def set_mac_port_alerts_enabled(enabled: bool) -> None:
+    from app.models import AppSetting
+
+    AppSetting.set_value(_KEY_MAC_PORT_ALERTS, "1" if enabled else "0")
+
+
+def classify_uplinks(rows, lldp_ports: set, mac_threshold: int) -> set:
+    """Portas que carregam tráfego de outros switches, e não um endpoint.
+
+    ``rows`` são as entradas FDB frescas (objetos com ``switch_device_id``,
+    ``local_port`` e ``remote_mac``). Devolve o conjunto de
+    ``(switch_device_id, local_port)`` a desconsiderar.
+    """
+    counts: dict[tuple, set] = {}
+    for row in rows:
+        counts.setdefault((row.switch_device_id, row.local_port), set()).add(row.remote_mac)
+
+    uplinks = set(lldp_ports)
+    for key, macs in counts.items():
+        if len(macs) > mac_threshold:
+            uplinks.add(key)
+    return uplinks
+
+
+def _overlapping(rows) -> bool:
+    """True se as janelas de observação de duas entradas se sobrepõem.
+
+    Sobreposição = o MAC foi visto nas duas portas de forma alternada. Janelas
+    disjuntas são uma mudança de tomada, que não é achado de segurança.
+    """
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            if a.first_seen_at <= b.last_seen_at and b.first_seen_at <= a.last_seen_at:
+                return True
+    return False
+
+
+def _recent_mac_port_alert(profile_id: int, mac: str, now, hours: int) -> bool:
+    from datetime import timedelta
+
+    from app.models import Alert, AlertType
+
+    return Alert.query.filter(
+        Alert.profile_id == profile_id,
+        Alert.alert_type == AlertType.MAC_PORT_CONFLICT,
+        Alert.match_value == mac,
+        Alert.created_at >= now - timedelta(hours=hours),
+    ).first() is not None
+
+
+def check_mac_port_anomalies(profile, lldp_ports: set, now) -> list[dict]:
+    """Procura MACs aprendidos em mais de uma porta de acesso e alerta.
+
+    Roda depois da coleta, sobre as entradas FDB persistidas e ainda frescas de
+    **todos** os switches do perfil — a comparação entre switches é o ponto.
+
+    Returns: lista de dicts com ``mac``, ``ports`` e ``reason``.
+    """
+    from datetime import timedelta
+
+    from flask import current_app
+
+    from app.extensions import db
+    from app.models import AlertType, Device, Severity, SwitchNeighbor
+    from app.scanner.scheduling import emit_alert
+
+    findings: list[dict] = []
+    if not is_mac_port_alerts_enabled(current_app):
+        return findings
+
+    interval_h = int(current_app.config.get("TOPOLOGY_LLDP_INTERVAL_HOURS", 6))
+    fresh_cutoff = now - timedelta(hours=max(interval_h * 2, 2))
+    threshold = int(current_app.config.get("TOPOLOGY_UPLINK_MAC_THRESHOLD", 4))
+    dedup_hours = int(current_app.config.get("MAC_PORT_ALERT_DEDUP_HOURS", 12))
+
+    rows = SwitchNeighbor.query.filter(
+        SwitchNeighbor.profile_id == profile.id,
+        SwitchNeighbor.source == "fdb",
+        SwitchNeighbor.remote_mac != "",
+        SwitchNeighbor.last_seen_at >= fresh_cutoff,
+    ).all()
+    if not rows:
+        return findings
+
+    uplinks = classify_uplinks(rows, lldp_ports, threshold)
+
+    by_mac: dict[str, list] = {}
+    for row in rows:
+        if (row.switch_device_id, row.local_port) in uplinks:
+            continue
+        by_mac.setdefault(row.remote_mac, []).append(row)
+
+    switch_names = {
+        d.id: d.display_name
+        for d in Device.query.filter_by(profile_id=profile.id).all()
+    }
+
+    emitted = 0
+    for mac, mac_rows in by_mac.items():
+        if len(mac_rows) < 2:
+            continue
+
+        switches = {r.switch_device_id for r in mac_rows}
+        if len(switches) > 1:
+            reason = "switches distintos"
+        elif _overlapping(mac_rows):
+            reason = "portas alternadas no mesmo switch"
+        else:
+            continue  # mudou de tomada: janelas disjuntas, não é achado
+
+        places = ", ".join(sorted(
+            f"{switch_names.get(r.switch_device_id, f'switch #{r.switch_device_id}')}:{r.local_port}"
+            for r in mac_rows
+        ))
+        findings.append({"mac": mac, "ports": places, "reason": reason})
+
+        if _recent_mac_port_alert(profile.id, mac, now, dedup_hours):
+            continue
+
+        device = Device.query.filter_by(profile_id=profile.id, mac=mac).first()
+        if device is not None:
+            severity, priority = Severity.CRITICAL, True
+            tail = (
+                f"O MAC pertence ao ativo cadastrado {device.display_name}, "
+                "ou seja, alguém está se passando por um equipamento conhecido."
+            )
+        else:
+            severity, priority = Severity.WARNING, False
+            tail = "O MAC não corresponde a nenhum ativo cadastrado neste perfil."
+
+        emit_alert(
+            profile.id, device.id if device else None,
+            AlertType.MAC_PORT_CONFLICT, severity,
+            (
+                f"MAC {mac} aprendido em portas de acesso distintas ({reason}): {places}. "
+                "Um endereço só pode estar fisicamente em uma porta — duas indicam MAC "
+                f"clonado ou laço de camada 2. {tail}"
+            ),
+            match_value=mac, is_priority=priority,
+            notify_profile=profile, notify_device=device,
+        )
+        emitted += 1
+        logger.warning(
+            "MAC_PORT_CONFLICT (%s): %s em %s (%s)", profile.name, mac, places, reason
+        )
+
+    if emitted:
+        db.session.commit()
+    return findings

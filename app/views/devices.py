@@ -171,20 +171,36 @@ def device_list():
 
         ip_rows = (
             DeviceIp.query
-            .with_entities(DeviceIp.device_id, DeviceIp.ip)
+            .with_entities(DeviceIp.device_id, DeviceIp.ip, DeviceIp.ip_version)
             .filter(DeviceIp.device_id.in_(page_ids), DeviceIp.is_current == True)
             .order_by(DeviceIp.last_seen_at.asc())
             .all()
         )
-        # Devices multi-IP: exibe todos os IPs atuais separados por vírgula
-        # (o mais recente por último graças à ordenação acima). Deduplica por IP
-        # para não repetir quando há linhas DeviceIp duplicadas para o mesmo IP.
-        _ip_lists: dict[int, list[str]] = {}
-        for did, ip in ip_rows:
+        # Um ativo pode ter IPv4 e IPv6 ao mesmo tempo (famílias não concorrentes,
+        # agrupadas pelo MAC) e, se for multi-IP, vários IPv4. O template exibe um
+        # por linha: IPv4 primeiro, depois os IPv6 roteáveis e por fim os
+        # link-local. Deduplica por IP para não repetir quando há linhas DeviceIp
+        # duplicadas para o mesmo endereço.
+        from app.scanner.hosts6 import SCOPE_LINK_LOCAL, ipv6_scope
+
+        def _ip_sort_key(entry):
+            if entry["version"] == 4:
+                return 0
+            return 2 if entry["scope"] == SCOPE_LINK_LOCAL else 1
+
+        _ip_lists: dict[int, list[dict]] = {}
+        for did, ip, version in ip_rows:
             lst = _ip_lists.setdefault(did, [])
-            if ip not in lst:
-                lst.append(ip)
-        current_ips = {did: ", ".join(lst) for did, lst in _ip_lists.items()}
+            if any(e["ip"] == ip for e in lst):
+                continue
+            lst.append({
+                "ip": ip,
+                "version": version,
+                "scope": ipv6_scope(ip) if version == 6 else "",
+            })
+        current_ips = {
+            did: sorted(lst, key=_ip_sort_key) for did, lst in _ip_lists.items()
+        }
 
         count_rows = (
             Port.query

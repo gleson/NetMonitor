@@ -140,8 +140,17 @@ def _update_device_from_row(device: Device, row: dict) -> None:
 
 
 def _set_device_ip(device: Device, ip: str) -> None:
-    """Define o IP atual de um device recém-criado."""
-    DeviceIp.query.filter_by(device_id=device.id, is_current=True).update({"is_current": False})
+    """Define o IP atual de um device recém-criado.
+
+    Rebaixa apenas endereços da MESMA família: IPv4 e IPv6 coexistem no mesmo
+    ativo, então importar o IPv6 não pode derrubar o IPv4 e vice-versa.
+    """
+    version = 6 if ":" in ip else 4
+    (
+        DeviceIp.query
+        .filter_by(device_id=device.id, is_current=True, ip_version=version)
+        .update({"is_current": False})
+    )
     dip = DeviceIp(
         device_id=device.id,
         ip=ip,
@@ -150,6 +159,24 @@ def _set_device_ip(device: Device, ip: str) -> None:
         last_seen_at=_utcnow(),
     )
     db.session.add(dip)
+
+
+def _set_device_ipv6s(device: Device, raw: str) -> None:
+    """Registra os IPv6 vindos do arquivo (separados por espaço, vírgula ou ;).
+
+    Todos permanecem atuais ao mesmo tempo — é o normal de um host IPv6
+    (link-local + global + temporários), todos do mesmo MAC.
+    """
+    from app.scanner.hosts6 import ipv6_scope
+
+    for token in raw.replace(",", " ").replace(";", " ").split():
+        ip = token.strip()
+        if not ipv6_scope(ip):
+            continue
+        db.session.add(DeviceIp(
+            device_id=device.id, ip=ip, is_current=True,
+            first_seen_at=_utcnow(), last_seen_at=_utcnow(),
+        ))
 
 
 def _parse_import_json(text: str) -> list[dict]:
@@ -273,6 +300,14 @@ def import_devices():
             if ip:
                 _set_device_ip(device, ip)
 
+            # IPv6 do mesmo ativo (lista). Aceita tanto o array do JSON quanto a
+            # string separada por espaços do CSV.
+            raw_v6 = row.get("current_ipv6") or row.get("IPv6") or ""
+            if isinstance(raw_v6, (list, tuple)):
+                raw_v6 = " ".join(str(x) for x in raw_v6)
+            if raw_v6:
+                _set_device_ipv6s(device, str(raw_v6))
+
             created += 1
 
     try:
@@ -348,6 +383,7 @@ def export_devices():
                 "device_type": d.device_type.value if d.device_type else "",
                 "os_guess": d.os_guess or "",
                 "current_ip": d.current_ip or "",
+                "current_ipv6": d.current_ipv6s,
                 "situation": d.situation or "",
                 "tags": d.tags or "",
                 "notes": d.notes or "",
@@ -377,7 +413,7 @@ def export_devices():
         writer = csv.writer(buf)
         writer.writerow([
             "mac", "friendly_name", "hostname", "vendor", "device_type",
-            "os_guess", "current_ip", "situation", "tags", "notes",
+            "os_guess", "current_ip", "current_ipv6", "situation", "tags", "notes",
             "open_ports_count", "first_seen_at", "last_seen_at",
         ])
         yield buf.getvalue()
@@ -392,6 +428,7 @@ def export_devices():
                 d.vendor or "",
                 d.device_type.value if d.device_type else "",
                 d.os_guess or "", d.current_ip or "",
+                " ".join(d.current_ipv6s),
                 d.situation or "", d.tags or "", d.notes or "",
                 port_count,
                 _fmt_dt(d.first_seen_at), _fmt_dt(d.last_seen_at),

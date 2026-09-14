@@ -66,6 +66,304 @@
                 {% endif %}
             </div>
 
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="mac_port_alerts_enabled" class="form-check-input" id="macPortAlerts"
+                       {% if mac_port_alerts_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="macPortAlerts">
+                    Alertar quando o mesmo MAC aparecer em portas de acesso distintas
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Sai de graça da coleta acima — nenhuma consulta nova. Um endereço MAC só pode
+                estar fisicamente numa porta; em duas, ou foi clonado, ou existe um laço de
+                camada 2. Duas situações são consideradas:
+                <ul class="mb-2 mt-1">
+                    <li><strong>Switches diferentes</strong> — o MAC aparece numa porta de acesso
+                        de dois switches. No caminho normal ele aparece na porta de acesso de um e
+                        no <em>uplink</em> dos outros.</li>
+                    <li><strong>Portas alternadas no mesmo switch</strong> — as janelas de
+                        observação se sobrepõem. Trocar de tomada gera janelas separadas e
+                        <em>não</em> alerta; só a oscilação entre as duas alerta.</li>
+                </ul>
+                Portas de uplink são descartadas pelo LLDP e pela contagem de MACs aprendidos
+                (acima de {{ uplink_mac_threshold }} endereços a porta é tratada como uplink).
+                Crítico quando o MAC pertence a um ativo cadastrado — aí alguém está se passando
+                por um equipamento conhecido. Depende da topologia estar ligada.
+            </div>
+
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-globe2"></i> Monitoramento IPv6</h6>
+            {% if not ipv6_available %}
+            <div class="alert alert-secondary py-2 small">
+                Nenhuma interface deste host tem IPv6 ativo no momento. As opções abaixo
+                podem ser ligadas, mas não encontrarão nada até haver IPv6 na rede.
+            </div>
+            {% endif %}
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="ipv6_discovery_enabled" class="form-check-input" id="ipv6Discovery"
+                       {% if ipv6_discovery_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="ipv6Discovery">
+                    <strong>Descoberta ativa</strong> — solicitar vizinhos IPv6 (ICMPv6 em ff02::1)
+                    e ler a tabela de vizinhança (NDP) a cada ciclo de discovery
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Os endereços encontrados são agrupados no ativo já cadastrado com o
+                <strong>mesmo MAC</strong> — o ativo passa a ter IPv4 e IPv6 lado a lado, sem que um
+                substitua o outro. Não requer root. Vizinhos IPv6 cujo MAC não corresponde a nenhum
+                ativo são ignorados (não criam dispositivo).
+            </div>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="ipv6_passive_enabled" class="form-check-input" id="ipv6Passive"
+                       {% if ipv6_passive_enabled %}checked{% endif %} {% if not has_root %}disabled{% endif %}>
+                <label class="form-check-label" for="ipv6Passive">
+                    <strong>Descoberta passiva</strong> — capturar NDP/ICMPv6 no sniffer,
+                    aprendendo endereços IPv6 sem gerar tráfego
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Depende da descoberta passiva (ARP) acima estar ligada — é o mesmo sniffer, com o
+                filtro ampliado. Alterar esta opção reinicia o sniffer.
+                {% if not has_root %}
+                <span class="text-warning d-block">Requer executar o app como root. Indisponível no momento.</span>
+                {% endif %}
+            </div>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="ipv6_port_scan_enabled" class="form-check-input" id="ipv6PortScan"
+                       {% if ipv6_port_scan_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="ipv6PortScan">
+                    <strong>Port scan IPv6</strong> — varrer as portas do perfil sobre o IPv6
+                    global/ULA dos ativos online (<code>nmap -6</code>)
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Job próprio, a cada {{ ipv6_scan_interval }}h. Existe porque as regras de firewall
+                costumam divergir entre as duas famílias: uma porta bloqueada no IPv4 pode estar
+                exposta no IPv6. As portas ficam registradas como <code>tcp6</code>/<code>udp6</code>,
+                separadas das IPv4 do mesmo ativo. Link-local (fe80::) não é escaneado.
+            </div>
+
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-shield-exclamation"></i> Detecção de man-in-the-middle</h6>
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="mitm_enabled" class="form-check-input" id="mitmEnabled"
+                       {% if mitm_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="mitmEnabled">
+                    Vigiar os indícios de interceptação de tráfego
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Cobre cinco vetores, todos passivos ou de custo desprezível (nenhum gera varredura):
+                <ul class="mb-2 mt-1">
+                    <li><strong>Gateway trocado</strong> — o MAC do roteador padrão mudou. É o sinal
+                        mais direto de MITM bem-sucedido.</li>
+                    <li><strong>ARP/NDP spoofing</strong> — um MAC reivindica o IP de um ativo que
+                        ainda está online, detectado inclusive pelo sniffer passivo (o ataque
+                        costuma envenenar a vítima sem responder às varreduras do monitor).</li>
+                    <li><strong>DHCP rogue</strong> — segundo servidor DHCP entregando gateway e
+                        DNS falsos.</li>
+                    <li><strong>Router Advertisement rogue</strong> — roteador IPv6 forjado. Requer
+                        a descoberta passiva IPv6 ligada.</li>
+                    <li><strong>Certificado TLS trocado</strong> — impressão digital diferente;
+                        crítico quando o emissor muda junto (rastro de proxy de interceptação).</li>
+                </ul>
+            </div>
+
+            {% if mitm_baselines %}
+            <div class="card bg-black border-secondary mb-3">
+                <div class="card-body py-2">
+                    <div class="small text-muted mb-2">
+                        Referências aprendidas — é contra elas que as mudanças são comparadas:
+                    </div>
+                    {% for pid, b in mitm_baselines.items() %}
+                    <div class="mb-2">
+                        <div class="small"><strong>{{ b.name }}</strong></div>
+                        <div class="small text-muted ms-2">
+                            Gateways:
+                            {% if b.gateways %}
+                                {% for ip, mac in b.gateways.items() %}<code>{{ ip }} → {{ mac }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                            {% else %}<em>ainda não aprendido</em>{% endif %}
+                        </div>
+                        <div class="small text-muted ms-2">
+                            Servidores DHCP:
+                            {% if b.dhcp_servers %}
+                                {% for mac, ip in b.dhcp_servers.items() %}<code>{{ mac }} ({{ ip }})</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                            {% else %}<em>ainda não aprendido</em>{% endif %}
+                        </div>
+                        <div class="small text-muted ms-2">
+                            Roteadores IPv6:
+                            {% if b.ipv6_routers %}
+                                {% for mac, ip in b.ipv6_routers.items() %}<code>{{ mac }} ({{ ip }})</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                            {% else %}<em>ainda não aprendido</em>{% endif %}
+                        </div>
+                        <div class="small text-muted ms-2">
+                            Servidores DNS:
+                            {% if b.dns_resolvers %}
+                                {% for srv in b.dns_resolvers %}<code>{{ srv }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                            {% else %}<em>ainda não aprendido</em>{% endif %}
+                        </div>
+                    </div>
+                    {% endfor %}
+                    <div class="form-check mt-2">
+                        <input type="checkbox" name="reset_mitm_baselines" class="form-check-input" id="resetMitm">
+                        <label class="form-check-label small text-warning" for="resetMitm">
+                            Redefinir ao salvar — use após troca legítima de roteador, servidor
+                            DHCP ou DNS; sem isso o equipamento novo seguiria alertando como suspeito.
+                        </label>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-wifi"></i> Ambiente Wi-Fi (ponto de acesso não autorizado)</h6>
+
+            {% if not wifi_available %}
+            <div class="alert alert-secondary py-2 small">
+                Este host não tem interface Wi-Fi gerenciada pelo NetworkManager. A opção pode
+                ficar ligada, mas não encontrará nada.
+            </div>
+            {% endif %}
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="wifi_watch_enabled" class="form-check-input" id="wifiWatch"
+                       {% if wifi_watch_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="wifiWatch">
+                    Vigiar as redes sem fio ao alcance (evil twin)
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                A cada {{ wifi_interval }}h lista os pontos de acesso ao alcance
+                (<code>nmcli</code>) e compara com a referência aprendida. <strong>Não exige root
+                nem modo monitor</strong>: é a mesma varredura que a placa já faz para roaming.
+                Um evil twin anuncia o SSID da sua rede e captura tudo no rádio, antes de
+                qualquer pacote chegar à rede cabeada — nenhuma das outras detecções o enxerga.
+                <ul class="mb-2 mt-1">
+                    <li><strong>Rádio novo num SSID vigiado</strong> — crítico quando o
+                        fabricante (OUI) não bate com os já conhecidos daquela rede; mesmo
+                        fabricante costuma ser repetidor legítimo e fica em aviso.</li>
+                    <li><strong>Clone aberto</strong> — o SSID protegido aparecendo sem
+                        criptografia. É o golpe clássico: não precisa da senha, basta sinal
+                        mais forte.</li>
+                    <li><strong>Rebaixamento</strong> — um BSSID conhecido que trocou WPA2/WPA3
+                        por WEP/WPA1 ou por rede aberta.</li>
+                </ul>
+                Custo: a placa sai do canal por algumas centenas de milissegundos por varredura.
+            </div>
+
+            {% if wifi_watch_enabled and wifi_watched %}
+            <div class="card bg-black border-secondary mb-3">
+                <div class="card-body py-2">
+                    <div class="small text-muted mb-2">
+                        <strong>Redes vigiadas</strong> — um SSID por linha. Só estas geram
+                        alerta; as demais são apenas memorizadas como retrato do ambiente,
+                        porque o vizinho trocando de roteador não é problema deste monitor.
+                        Deixe em branco e o monitor semeia com a rede à qual este host estiver
+                        associado.
+                    </div>
+                    {% for pid, w in wifi_watched.items() %}
+                    <div class="mb-2">
+                        <label class="form-label small mb-1" for="ssids{{ pid }}">
+                            <strong>{{ w.name }}</strong>
+                        </label>
+                        <textarea name="watched_ssids_{{ pid }}" id="ssids{{ pid }}" rows="2"
+                                  class="form-control form-control-sm font-monospace"
+                                  placeholder="Um SSID por linha">{{ w.ssids | join('\n') }}</textarea>
+                    </div>
+                    {% endfor %}
+                    {% if wifi_visible %}
+                    <div class="small text-muted mt-2">
+                        Ao alcance agora:
+                        {% for ssid in wifi_visible %}<code>{{ ssid }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endif %}
+
+            <hr class="border-secondary my-4">
+            <h6 class="text-muted mb-3"><i class="bi bi-clipboard-check"></i> Higiene dos serviços expostos</h6>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="dns_check_enabled" class="form-check-input" id="dnsCheck"
+                       {% if dns_check_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="dnsCheck">
+                    Verificar a integridade do DNS da rede
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                A cada {{ dns_check_interval }}h, compara os servidores DNS configurados com a
+                referência aprendida e pergunta a cada um deles por domínios âncora de endereço
+                público conhecido (<code>one.one.one.one</code>, <code>dns.google</code>,
+                <code>dns.quad9.net</code>). Resposta divergente significa que o resolvedor está
+                reescrevendo respostas. Sequestro de DNS desvia qualquer conexão
+                <strong>sem tocar em ARP ou NDP</strong>, então nenhuma das outras checagens o
+                enxerga. Custo: alguns pacotes UDP por execução.
+            </div>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="hardening_enabled" class="form-check-input" id="hardening"
+                       {% if hardening_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="hardening">
+                    Procurar configurações inseguras conhecidas (SMB e SNMP)
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                A cada {{ hardening_interval }}h, procura o que não depende de CVE nenhum — é o
+                padrão de fábrica que nunca foi trocado:
+                <ul class="mb-2 mt-1">
+                    <li><strong>SMBv1 habilitado</strong> — protocolo obsoleto e sem correção
+                        possível; é o vetor de EternalBlue/WannaCry. Só perguntado a quem tem
+                        445/139 aberto.</li>
+                    <li><strong>Assinatura SMB não exigida</strong> — permite NTLM relay: o
+                        atacante repassa a autenticação da vítima para outro host e entra como
+                        ela, sem descobrir a senha.</li>
+                    <li><strong>Comunidade SNMP de fábrica</strong> (<code>public</code>/<code>private</code>)
+                        — quem estiver na rede lê a configuração inteira do equipamento; em ponto
+                        de acesso isso costuma incluir a chave do Wi-Fi. Testada em todo ativo
+                        online, porque a porta 161 é UDP e só apareceria no scan UDP semanal,
+                        que exige root — e são justamente impressoras, câmeras e pontos de acesso
+                        que mais mantêm o padrão.</li>
+                </ul>
+                Os achados aparecem como vulnerabilidades no ativo e somem sozinhos quando o
+                equipamento é corrigido. Não requer root.
+            </div>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="service_change_enabled" class="form-check-input" id="svcChange"
+                       {% if service_change_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="svcChange">
+                    Alertar quando o serviço ou a versão de uma porta mudar
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Usa o banner que o port scan já coleta (<code>-sV</code>) — sem tráfego adicional.
+                Uma versão diferente numa porta estável é atualização legítima (e serve de
+                confirmação de que o patch foi aplicado), troca de equipamento reaproveitando o IP,
+                ou software estranho ocupando a porta. Porta autorizada no baseline também alerta:
+                autorizar declara que a porta <em>pode estar aberta</em>, não que qualquer software
+                pode atender nela.
+            </div>
+
+            <div class="form-check form-switch mb-2">
+                <input type="checkbox" name="tls_quality_enabled" class="form-check-input" id="tlsQuality"
+                       {% if tls_quality_enabled %}checked{% endif %}>
+                <label class="form-check-label" for="tlsQuality">
+                    Avaliar a qualidade da configuração TLS
+                </label>
+            </div>
+            <div class="form-text text-muted mb-3">
+                Roda junto com a verificação de certificados, sobre a mesma conexão. Reporta
+                protocolo obsoleto (TLS 1.0/1.1, RFC 8996), assinatura SHA-1/MD5, chave RSA abaixo
+                de 2048 bits e certificado autoassinado. São achados de <em>configuração</em>, não
+                de ataque em curso — por isso não passam de AVISO, e o autoassinado sozinho fica em
+                INFO (numa LAN é a regra, não a exceção). Reavaliação silenciosa por
+                {{ tls_quality_recheck }} dias enquanto o achado não mudar.
+            </div>
+
             <button type="submit" class="btn btn-primary">
                 <i class="bi bi-save"></i> Salvar
             </button>

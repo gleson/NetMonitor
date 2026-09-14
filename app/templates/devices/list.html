@@ -1,6 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Dispositivos - NetMonitor{% endblock %}
 
+{% block extra_css %}
+<style>
+    /* Um endereço por linha: um ativo pode ter IPv4 e IPv6 ao mesmo tempo.
+       nowrap evita que um IPv6 (até 39 caracteres) quebre no meio e fique
+       ilegível; a célula rola horizontalmente junto com a tabela. */
+    .ip-cell { white-space: nowrap; }
+    .ip-cell code { font-size: .85em; }
+    .ip-cell > div + div { margin-top: .15rem; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
     <h2><i class="bi bi-pc-display"></i> Dispositivos</h2>
@@ -250,7 +261,27 @@
                 </td>
                 <td>{{ device.friendly_name or '-' }}</td>
                 <td>{{ device.hostname or '-' }}</td>
-                <td><code>{{ current_ips.get(device.id) or '-' }}</code></td>
+                <td class="ip-cell">
+                    {% set ips = current_ips.get(device.id) %}
+                    {% if ips %}
+                        {% for entry in ips %}
+                        <div>
+                            {% if entry.version == 6 %}
+                            <code class="text-info small"
+                                  title="IPv6 {{ entry.scope }} — mesmo ativo, agrupado pelo MAC">{{ entry.ip }}</code>
+                            {% if entry.scope == 'link-local' %}
+                            <span class="badge bg-secondary ms-1" style="font-size:.65em;"
+                                  title="Endereço link-local (fe80::): válido apenas neste segmento de rede">LL</span>
+                            {% endif %}
+                            {% else %}
+                            <code>{{ entry.ip }}</code>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    {% else %}
+                        <code>-</code>
+                    {% endif %}
+                </td>
                 <td><code>{{ device.mac }}</code></td>
                 <td>{{ device.vendor or '-' }}</td>
                 <td><span class="badge bg-secondary">{{ device.device_type.value }}</span></td>

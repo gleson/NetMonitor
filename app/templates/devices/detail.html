@@ -25,9 +25,9 @@
                     <tr><th>Vendor</th><td>{{ device.vendor or '-' }}</td></tr>
                     <tr><th>OS Guess</th><td>{{ device.os_guess or '-' }}</td></tr>
                     <tr>
-                        <th>IP{{ 's Atuais' if device.is_multi_ip else ' Atual' }}</th>
+                        <th>IPv4{{ ' Atuais' if device.is_multi_ip else ' Atual' }}</th>
                         <td>
-                            {% set cur_ips = device.current_ips %}
+                            {% set cur_ips = device.current_ipv4s %}
                             {% if cur_ips %}
                                 {% for cip in cur_ips %}<code>{{ cip }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
                             {% else %}
@@ -38,6 +38,27 @@
                             {% endif %}
                         </td>
                     </tr>
+                    {% set cur_ipv6 = device.current_ipv6s %}
+                    {% if cur_ipv6 %}
+                    <tr>
+                        <th>IPv6</th>
+                        <td>
+                            {% for cip in cur_ipv6 %}
+                            <div>
+                                <code class="text-info">{{ cip }}</code>
+                                {% if cip.startswith('fe80:') %}
+                                <span class="badge bg-secondary ms-1" style="font-size:.7em;"
+                                      title="Link-local: válido apenas neste segmento de rede, não roteável">link-local</span>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                            <div class="form-text text-muted mt-1">
+                                Mesmo ativo — endereços agrupados pelo MAC
+                                <code>{{ device.mac }}</code>. IPv4 e IPv6 coexistem.
+                            </div>
+                        </td>
+                    </tr>
+                    {% endif %}
                     <tr>
                         <th>Situação</th>
                         <td>

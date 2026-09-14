@@ -96,6 +96,11 @@ class Config:
     ALERT_RETENTION_DAYS = int(os.environ.get("ALERT_RETENTION_DAYS", 90))
     SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", 180))
     AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AUDIT_LOG_RETENTION_DAYS", 365))
+    # Quantas entradas recentes a tela /admin/audit confere a cada carregamento.
+    # Verificar o histórico inteiro não escala; o valor prático está no fim da
+    # cadeia, que é onde um invasor apagaria o próprio rastro. Auditoria
+    # completa fica no CLI: `flask verify-audit-chain`.
+    AUDIT_CHAIN_UI_LIMIT = int(os.environ.get("AUDIT_CHAIN_UI_LIMIT", 500))
 
     # --- Notificações (webhook / SMTP) ---
     NOTIFICATIONS_ENABLED = os.environ.get("NOTIFICATIONS_ENABLED", "1") == "1"
@@ -157,6 +162,43 @@ class Config:
     TLS_CHECK_INTERVAL_HOURS = int(os.environ.get("TLS_CHECK_INTERVAL_HOURS", 24))
     TLS_CERT_WARN_DAYS = int(os.environ.get("TLS_CERT_WARN_DAYS", 15))
 
+    # --- Qualidade da configuração TLS ---
+    # Além da expiração, avalia o que o servidor negocia: versão do protocolo,
+    # algoritmo de assinatura do certificado e tamanho da chave. Roda dentro do
+    # job TLS (mesma conexão, custo zero adicional). Re-alerta só depois de
+    # TLS_QUALITY_RECHECK_DAYS — achado de configuração não muda sozinho.
+    TLS_QUALITY_ENABLED = os.environ.get("TLS_QUALITY_ENABLED", "1") == "1"
+    TLS_QUALITY_RECHECK_DAYS = int(os.environ.get("TLS_QUALITY_RECHECK_DAYS", 30))
+
+    # --- Mudança de serviço/versão em portas conhecidas ---
+    # Alerta quando o banner (-sV) de uma porta já mapeada muda. Pega tanto
+    # atualização legítima quanto troca de equipamento no mesmo IP.
+    SERVICE_CHANGE_ALERTS_ENABLED = os.environ.get("SERVICE_CHANGE_ALERTS_ENABLED", "1") == "1"
+    SERVICE_CHANGE_DEDUP_HOURS = int(os.environ.get("SERVICE_CHANGE_DEDUP_HOURS", 24))
+
+    # --- Configurações inseguras conhecidas (SMB / SNMP) ---
+    # Procura o que dispensa CVE nenhum: SMBv1 ligado, assinatura SMB não
+    # exigida e comunidade SNMP de fábrica ainda aceita. Não requer root.
+    # 0 no intervalo desativa.
+    HARDENING_CHECKS_ENABLED = os.environ.get("HARDENING_CHECKS_ENABLED", "1") == "1"
+    HARDENING_CHECK_INTERVAL_HOURS = int(os.environ.get("HARDENING_CHECK_INTERVAL_HOURS", 24))
+    # SNMP é UDP/161 e só apareceria no scan UDP semanal (que exige root) —
+    # justamente os equipamentos que mais têm comunidade padrão (impressora,
+    # câmera, ponto de acesso) ficariam de fora. Por isso, por padrão, a
+    # comunidade é testada em todo ativo online: um pacote UDP por comunidade.
+    HARDENING_SNMP_PROBE_ALL = os.environ.get("HARDENING_SNMP_PROBE_ALL", "1") == "1"
+    # A sondagem é paralela: serialmente, os timeouts de SNMP e os scans NSE se
+    # somam host a host e o job levaria minutos numa rede grande.
+    HARDENING_MAX_WORKERS = int(os.environ.get("HARDENING_MAX_WORKERS", 10))
+
+    # --- Integridade do DNS ---
+    # Resolve domínios âncora (IPs públicos e estáveis) pelos servidores DNS da
+    # rede e compara com o esperado; também vigia a própria lista de
+    # resolvedores. 0 desativa. Requer saída UDP/53 para os servidores da rede.
+    DNS_CHECK_ENABLED = os.environ.get("DNS_CHECK_ENABLED", "1") == "1"
+    DNS_CHECK_INTERVAL_HOURS = int(os.environ.get("DNS_CHECK_INTERVAL_HOURS", 6))
+    DNS_QUERY_TIMEOUT = float(os.environ.get("DNS_QUERY_TIMEOUT", 3))
+
     # --- Métricas Prometheus ---
     # Endpoint /api/metrics/prometheus (texto Prometheus, sem login). Desligado
     # por padrão para não expor contagens da rede sem intenção explícita. Quando
@@ -180,6 +222,48 @@ class Config:
     # runtime via /admin/scan-settings (AppSetting 'topology_lldp_enabled').
     TOPOLOGY_LLDP_ENABLED = os.environ.get("TOPOLOGY_LLDP_ENABLED", "0") == "1"
     TOPOLOGY_LLDP_INTERVAL_HOURS = int(os.environ.get("TOPOLOGY_LLDP_INTERVAL_HOURS", 6))
+    # Alerta MAC_PORT_CONFLICT: mesmo MAC aprendido em portas de acesso
+    # distintas. Sai de graça da coleta acima — não faz consulta nova.
+    TOPOLOGY_MAC_PORT_ALERTS = os.environ.get("TOPOLOGY_MAC_PORT_ALERTS", "1") == "1"
+    # Acima de quantos MACs distintos uma porta é tratada como uplink (e não
+    # como tomada de endpoint). Uplink carrega a rede inteira; porta de acesso
+    # carrega um ou dois endereços. Complementa o LLDP, cujo rótulo de porta
+    # local nem sempre coincide com o ifName usado pela FDB.
+    TOPOLOGY_UPLINK_MAC_THRESHOLD = int(os.environ.get("TOPOLOGY_UPLINK_MAC_THRESHOLD", 4))
+    MAC_PORT_ALERT_DEDUP_HOURS = int(os.environ.get("MAC_PORT_ALERT_DEDUP_HOURS", 12))
+
+    # --- Vigilância do ambiente Wi-Fi (ponto de acesso não autorizado) ---
+    # Lê as redes ao alcance via NetworkManager (nmcli). Não exige root nem modo
+    # monitor. Só alerta para os SSIDs marcados como vigiados no perfil.
+    WIFI_WATCH_ENABLED = os.environ.get("WIFI_WATCH_ENABLED", "1") == "1"
+    WIFI_SCAN_INTERVAL_HOURS = int(os.environ.get("WIFI_SCAN_INTERVAL_HOURS", 1))
+
+    # --- Descoberta e monitoramento IPv6 ---
+    # Complementa a descoberta ARP/IPv4 lendo a tabela de vizinhança IPv6 (NDP)
+    # do kernel. Os endereços encontrados são agrupados no ativo já existente
+    # pelo MAC — IPv4 e IPv6 coexistem no mesmo device, não competem.
+    # Não requer root: usa ICMPv6 multicast (ff02::1) + 'ip -6 neigh'.
+    IPV6_DISCOVERY_ENABLED = os.environ.get("IPV6_DISCOVERY_ENABLED", "1") == "1"
+    # Cataloga também os link-local (fe80::), que todo host IPv6 possui. São
+    # ruidosos (um por interface), mas provam que a pilha IPv6 está ativa mesmo
+    # em redes sem endereçamento global.
+    IPV6_INCLUDE_LINK_LOCAL = os.environ.get("IPV6_INCLUDE_LINK_LOCAL", "1") == "1"
+    # Endereços IPv6 não vistos há mais de N dias deixam de ser "atuais".
+    # Necessário por causa das privacy extensions (RFC 4941): Windows, Android e
+    # iOS trocam de endereço temporário a cada ~24h e, sem expiração, o ativo
+    # acumularia dezenas de IPv6 mortos na tela.
+    IPV6_ADDRESS_RETENTION_DAYS = int(os.environ.get("IPV6_ADDRESS_RETENTION_DAYS", 30))
+    # Port scan sobre o IPv6 global/ULA dos ativos (nmap -6), em job separado.
+    # Existe porque regras de firewall costumam divergir entre as duas famílias:
+    # uma porta bloqueada no IPv4 pode estar exposta no IPv6. 0 desabilita.
+    IPV6_PORT_SCAN_INTERVAL_HOURS = int(os.environ.get("IPV6_PORT_SCAN_INTERVAL_HOURS", 12))
+
+    # --- Detecção de man-in-the-middle ---
+    # Agrupa as checagens anti-MITM: integridade do MAC do gateway padrão,
+    # ARP/NDP spoofing detectado pelo sniffer passivo, servidor DHCP e Router
+    # Advertisement IPv6 não autorizados, e troca de certificado TLS.
+    # Todas são passivas ou de custo desprezível — nenhuma gera varredura.
+    MITM_DETECTION_ENABLED = os.environ.get("MITM_DETECTION_ENABLED", "1") == "1"
 
     # --- Dedupe de alertas de porta ---
     # Não re-emite o mesmo alerta (device+porta) dentro desta janela, evitando

@@ -304,12 +304,20 @@ def audit_log():
     pagination = q.order_by(AuditLog.created_at.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
+
+    # Integridade da cadeia. Verificar tudo a cada carregamento não escala, e o
+    # valor prático está nas entradas recentes — é ali que um invasor apagaria o
+    # rastro. A verificação completa fica no CLI (`flask verify-audit-chain`).
+    from app.audit_chain import verify_audit_chain
+    chain = verify_audit_chain(limit=int(current_app.config.get("AUDIT_CHAIN_UI_LIMIT", 500)))
+
     return render_template(
         "admin/audit_log.html",
         pagination=pagination,
         entries=pagination.items,
         action_filter=action_filter,
         user_filter=user_filter,
+        chain=chain,
     )
 
 
@@ -559,8 +567,11 @@ def scan_settings():
     """Painel de ajustes globais de scan editáveis em runtime.
 
     Expõe o intervalo do quick check de HOST_DOWN e os interruptores de
-    descoberta passiva (ARP) e topologia L2 (LLDP/FDB). Novas chaves podem ser
-    adicionadas aqui sem migration (AppSetting).
+    descoberta passiva (ARP), topologia L2 (LLDP/FDB), monitoramento IPv6
+    (descoberta ativa, descoberta passiva e port scan), detecção de MITM e as
+    checagens de higiene (integridade do DNS, mudança de serviço/versão e
+    qualidade do TLS). Novas chaves podem ser adicionadas aqui sem migration
+    (AppSetting).
     """
     from flask import current_app
     app_obj = current_app._get_current_object()
@@ -578,29 +589,111 @@ def scan_settings():
             flash("Intervalo deve estar entre 1 e 60 minutos.", "danger")
             return redirect(url_for("admin.scan_settings"))
 
+        from app.ipv6_settings import (
+            is_ipv6_passive_enabled, is_ipv6_port_scan_enabled,
+            set_ipv6_discovery_enabled, set_ipv6_passive_enabled,
+            set_ipv6_port_scan_enabled,
+        )
+        from app.scanner.hardening import is_hardening_enabled, set_hardening_enabled
+        from app.scanner.topology import set_mac_port_alerts_enabled
+        from app.scanner.wireless import (
+            is_wifi_watch_enabled, parse_watched_input, set_watched_ssids,
+            set_wifi_watch_enabled,
+        )
+        from app.security_settings import (
+            is_dns_check_enabled, set_dns_check_enabled,
+            set_service_change_enabled, set_tls_quality_enabled,
+        )
+
         passive_enabled = "passive_arp_enabled" in request.form
         topology_enabled = "topology_lldp_enabled" in request.form
+        ipv6_discovery = "ipv6_discovery_enabled" in request.form
+        ipv6_passive = "ipv6_passive_enabled" in request.form
+        ipv6_port_scan = "ipv6_port_scan_enabled" in request.form
+        mitm_enabled = "mitm_enabled" in request.form
+        dns_check = "dns_check_enabled" in request.form
+        hardening = "hardening_enabled" in request.form
+        service_change = "service_change_enabled" in request.form
+        tls_quality = "tls_quality_enabled" in request.form
+        mac_port_alerts = "mac_port_alerts_enabled" in request.form
+        wifi_watch = "wifi_watch_enabled" in request.form
+
         prev_passive = AppSetting.get_value(PASSIVE_ARP_KEY, "") in ("1", "true", "True", "on")
         prev_topology = AppSetting.get_value(TOPOLOGY_KEY, "") in ("1", "true", "True", "on")
+        prev_ipv6_passive = is_ipv6_passive_enabled(app_obj)
+        prev_ipv6_port_scan = is_ipv6_port_scan_enabled(app_obj)
+        prev_dns_check = is_dns_check_enabled(app_obj)
+        prev_hardening = is_hardening_enabled(app_obj)
+        prev_wifi = is_wifi_watch_enabled(app_obj)
 
         AppSetting.set_value(QUICK_CHECK_KEY, new_interval)
         AppSetting.set_value(PASSIVE_ARP_KEY, "1" if passive_enabled else "0")
         AppSetting.set_value(TOPOLOGY_KEY, "1" if topology_enabled else "0")
+        set_ipv6_discovery_enabled(ipv6_discovery)
+        set_ipv6_passive_enabled(ipv6_passive)
+        set_ipv6_port_scan_enabled(ipv6_port_scan)
+        AppSetting.set_value("mitm.enabled", "1" if mitm_enabled else "0")
+        set_dns_check_enabled(dns_check)
+        set_hardening_enabled(hardening)
+        set_service_change_enabled(service_change)
+        set_tls_quality_enabled(tls_quality)
+        set_mac_port_alerts_enabled(mac_port_alerts)
+        set_wifi_watch_enabled(wifi_watch)
+
+        # SSIDs vigiados: um por linha, por perfil. Sem eles a vigilância Wi-Fi
+        # só aprende o ambiente — não há como o monitor adivinhar quais redes ao
+        # alcance são do usuário, e alertar sobre as do vizinho seria só ruído.
+        for _p in Profile.query.all():
+            field = f"watched_ssids_{_p.id}"
+            if field in request.form:
+                set_watched_ssids(_p.id, parse_watched_input(request.form.get(field, "")))
+
+        # Redefinir baselines é ação à parte: limpa o que o monitor aprendeu
+        # sobre gateway/DHCP/roteadores IPv6/servidores DNS para reaprender do
+        # zero. Necessário após troca legítima de equipamento, que senão
+        # alertaria para sempre.
+        if request.form.get("reset_mitm_baselines"):
+            from app.models import Profile as _Profile
+            from app.scanner.mitm import reset_baselines
+            for _p in _Profile.query.all():
+                reset_baselines(_p.id)
+            audit("mitm.baseline_reset", "app_setting", None,
+                  details="Baselines de gateway/DHCP/RA/DNS redefinidos em todos os perfis")
+            flash("Baselines de MITM redefinidos — serão reaprendidos no próximo ciclo.", "info")
+
         audit("scan_settings.update", "app_setting", None,
               details=(f"{QUICK_CHECK_KEY}={new_interval} "
-                       f"{PASSIVE_ARP_KEY}={passive_enabled} {TOPOLOGY_KEY}={topology_enabled}"))
+                       f"{PASSIVE_ARP_KEY}={passive_enabled} {TOPOLOGY_KEY}={topology_enabled} "
+                       f"ipv6_discovery={ipv6_discovery} ipv6_passive={ipv6_passive} "
+                       f"ipv6_port_scan={ipv6_port_scan} mitm={mitm_enabled} "
+                       f"dns_check={dns_check} service_change={service_change} "
+                       f"tls_quality={tls_quality} hardening={hardening} "
+                       f"mac_port_alerts={mac_port_alerts} wifi_watch={wifi_watch}"))
         db.session.commit()
 
         # Reagenda os jobs de host-down nos perfis ativos
-        from app.scanner.scheduling import sync_quick_host_down_jobs, sync_topology_jobs
+        from app.scanner.scheduling import (
+            sync_dns_check_job, sync_hardening_jobs, sync_ipv6_jobs,
+            sync_quick_host_down_jobs, sync_topology_jobs, sync_wifi_watch_job,
+        )
         sync_quick_host_down_jobs(app_obj)
 
         # Aplica mudanças de estado dos recursos opcionais.
-        if passive_enabled != prev_passive:
+        # O sniffer precisa reiniciar quando o IPv6 passivo muda: o filtro BPF
+        # é definido na criação do AsyncSniffer e não pode ser alterado a quente.
+        if passive_enabled != prev_passive or ipv6_passive != prev_ipv6_passive:
             from app.scanner.passive import restart_passive_discovery
             restart_passive_discovery(app_obj)
         if topology_enabled != prev_topology:
             sync_topology_jobs(app_obj)
+        if ipv6_port_scan != prev_ipv6_port_scan:
+            sync_ipv6_jobs(app_obj)
+        if dns_check != prev_dns_check:
+            sync_dns_check_job(app_obj)
+        if hardening != prev_hardening:
+            sync_hardening_jobs(app_obj)
+        if wifi_watch != prev_wifi:
+            sync_wifi_watch_job(app_obj)
 
         flash(f"Configurações de scan atualizadas (quick check {new_interval} min).", "success")
         return redirect(url_for("admin.scan_settings"))
@@ -608,12 +701,38 @@ def scan_settings():
     quick_check_interval = AppSetting.get_int(QUICK_CHECK_KEY, default_quick)
 
     from app.scanner.passive import is_passive_discovery_enabled, is_passive_discovery_running
-    from app.scanner.topology import is_topology_enabled
+    from app.scanner.topology import is_mac_port_alerts_enabled, is_topology_enabled
+    from app.ipv6_settings import (
+        is_ipv6_discovery_enabled, is_ipv6_passive_enabled, is_ipv6_port_scan_enabled,
+    )
+    from app.scanner.hosts6 import is_ipv6_available
+    from app.scanner.hardening import is_hardening_enabled
+    from app.scanner.mitm import baselines_summary, is_mitm_detection_enabled
+    from app.scanner.wireless import (
+        get_watched_ssids, is_wifi_available, is_wifi_watch_enabled, scan_wifi_networks,
+    )
+    from app.security_settings import (
+        is_dns_check_enabled, is_service_change_enabled, is_tls_quality_enabled,
+    )
     import os
     try:
         has_root = os.geteuid() == 0
     except AttributeError:
         has_root = False
+
+    # Redes ao alcance, só para o admin poder copiar o SSID certo para a lista
+    # de vigiados. Usa o cache do NetworkManager (rescan=False): a página não
+    # deve tirar a placa do canal a cada carregamento.
+    wifi_watch_enabled = is_wifi_watch_enabled(app_obj)
+    wifi_available = is_wifi_available()
+    wifi_visible = []
+    if wifi_watch_enabled and wifi_available:
+        try:
+            wifi_visible = sorted(
+                {n["ssid"] for n in scan_wifi_networks(rescan=False, timeout=15)}
+            )
+        except Exception:
+            current_app.logger.debug("Falha ao listar redes Wi-Fi no painel.", exc_info=True)
 
     return render_template(
         "admin/scan_settings.html",
@@ -623,6 +742,31 @@ def scan_settings():
         passive_running=is_passive_discovery_running(),
         topology_enabled=is_topology_enabled(app_obj),
         has_root=has_root,
+        ipv6_discovery_enabled=is_ipv6_discovery_enabled(app_obj),
+        ipv6_passive_enabled=is_ipv6_passive_enabled(app_obj),
+        ipv6_port_scan_enabled=is_ipv6_port_scan_enabled(app_obj),
+        ipv6_available=is_ipv6_available(),
+        ipv6_scan_interval=int(current_app.config.get("IPV6_PORT_SCAN_INTERVAL_HOURS", 12)),
+        mitm_enabled=is_mitm_detection_enabled(app_obj),
+        mitm_baselines={
+            p.id: {"name": p.name, **baselines_summary(p.id)}
+            for p in Profile.query.filter_by(is_active=True).all()
+        },
+        dns_check_enabled=is_dns_check_enabled(app_obj),
+        dns_check_interval=int(current_app.config.get("DNS_CHECK_INTERVAL_HOURS", 6)),
+        service_change_enabled=is_service_change_enabled(app_obj),
+        tls_quality_enabled=is_tls_quality_enabled(app_obj),
+        tls_quality_recheck=int(current_app.config.get("TLS_QUALITY_RECHECK_DAYS", 30)),
+        hardening_enabled=is_hardening_enabled(app_obj),
+        hardening_interval=int(current_app.config.get("HARDENING_CHECK_INTERVAL_HOURS", 24)),
+        mac_port_alerts_enabled=is_mac_port_alerts_enabled(app_obj),
+        uplink_mac_threshold=int(current_app.config.get("TOPOLOGY_UPLINK_MAC_THRESHOLD", 4)),
+        wifi_watch_enabled=wifi_watch_enabled,
+        wifi_available=wifi_available,
+        wifi_interval=int(current_app.config.get("WIFI_SCAN_INTERVAL_HOURS", 1)),
+        wifi_visible=wifi_visible,
+        wifi_watched={p.id: {"name": p.name, "ssids": get_watched_ssids(p.id)}
+                      for p in Profile.query.filter_by(is_active=True).all()},
     )
 
 

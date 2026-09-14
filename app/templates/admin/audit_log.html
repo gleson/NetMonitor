@@ -6,6 +6,35 @@
     <h2><i class="bi bi-shield-check"></i> Audit Log</h2>
 </div>
 
+{% if chain %}
+<div class="alert {% if chain.ok %}alert-success{% else %}alert-danger{% endif %} py-2 d-flex align-items-start gap-2">
+    <i class="bi {% if chain.ok %}bi-link-45deg{% else %}bi-exclamation-octagon-fill{% endif %} fs-5"></i>
+    <div class="small">
+        <strong>Cadeia de integridade:</strong> {{ chain.summary }}
+        {% if chain.first_id %}
+        <span class="text-muted">(id {{ chain.first_id }}–{{ chain.last_id }})</span>
+        {% endif %}
+        <div class="text-muted mt-1">
+            {% if chain.ok %}
+                Cada entrada carrega o hash da anterior: editar uma linha invalida o hash dela,
+                e remover uma rompe o elo da seguinte. Verificação do histórico completo:
+                <code>flask verify-audit-chain</code>.
+            {% else %}
+                {% if chain.tampered %}
+                <strong>Conteúdo alterado</strong> não tem explicação benigna — as entradas
+                {{ chain.tampered|join(', ') }} foram editadas depois de gravadas.
+                {% endif %}
+                {% if chain.broken_links %}
+                Elo rompido indica entrada removida; sob <code>gunicorn -w N&gt;1</code> também
+                pode vir de escrita concorrente.
+                {% endif %}
+                Trate o registro como não confiável a partir do ponto indicado.
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endif %}
+
 <form method="GET" class="row g-2 mb-3">
     <div class="col-md-4">
         <input type="text" class="form-control form-control-sm" name="action"

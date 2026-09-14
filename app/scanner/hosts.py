@@ -595,6 +595,14 @@ def is_host_reachable(ip: str, timeout: int = 2, deep: bool = False) -> tuple[bo
         (is_up, method): is_up indica se o host foi alcançado;
                          method descreve como ("icmp", "arp", "tcp/80", etc.).
     """
+    # Endereço IPv6 → delega ao módulo IPv6 (ARP e AF_INET não se aplicam).
+    # Deixar seguir o fluxo abaixo daria falso "offline" para ativos alcançáveis
+    # apenas por IPv6, porque o probe TCP usa AF_INET e a tabela consultada é a
+    # do ARP (IPv4).
+    if ":" in ip:
+        from app.scanner.hosts6 import is_host_reachable6
+        return is_host_reachable6(ip, timeout=timeout, deep=deep)
+
     # 1. ICMP ping (também popula tabela ARP do kernel como efeito colateral)
     if scan_host_with_icmp(ip, timeout=1):
         return True, "icmp"

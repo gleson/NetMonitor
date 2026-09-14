@@ -633,8 +633,11 @@ def test_check_tls_certificates_alerts_on_expired(app, db, sample_profile, monke
 
     expired = _utcnow() - timedelta(days=3)
     monkeypatch.setattr(
-        scheduling, "_fetch_cert_not_after",
-        lambda ip, port, timeout=8: (expired, "CN=teste.local"),
+        scheduling, "_fetch_cert_info",
+        lambda ip, port, timeout=8: {
+            "not_after": expired, "subject": "CN=teste.local",
+            "issuer": "CN=CA teste", "fingerprint": "a" * 64,
+        },
     )
 
     scheduling.check_tls_certificates()
@@ -658,8 +661,11 @@ def test_check_tls_certificates_ignores_valid(app, db, sample_profile, monkeypat
 
     valid = _utcnow() + timedelta(days=200)
     monkeypatch.setattr(
-        scheduling, "_fetch_cert_not_after",
-        lambda ip, port, timeout=8: (valid, "CN=ok.local"),
+        scheduling, "_fetch_cert_info",
+        lambda ip, port, timeout=8: {
+            "not_after": valid, "subject": "CN=ok.local",
+            "issuer": "CN=CA ok", "fingerprint": "b" * 64,
+        },
     )
 
     scheduling.check_tls_certificates()

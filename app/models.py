@@ -2,12 +2,14 @@
 
 from datetime import date as _date, datetime, timezone, timedelta
 import enum
+import hashlib
+import itertools
 import json
 import os
 
 from cryptography.fernet import Fernet, InvalidToken
 from flask_login import UserMixin
-from sqlalchemy import func
+from sqlalchemy import event as sa_event, func
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from app.extensions import db, login_manager
@@ -92,6 +94,45 @@ class AlertType(enum.Enum):
     TLS_CERT_EXPIRING = "TLS_CERT_EXPIRING"
     # CVE conhecido correlacionado com serviço/versão detectado em porta aberta.
     VULNERABILITY = "VULNERABILITY"
+    # --- Detecção de man-in-the-middle ---
+    # MAC do gateway padrão mudou: ou o roteador foi trocado, ou alguém está se
+    # passando por ele. É o indicador clássico de ARP/NDP spoofing bem-sucedido.
+    GATEWAY_CHANGED = "GATEWAY_CHANGED"
+    # Servidor DHCP não autorizado respondendo na rede (DHCP rogue): entrega
+    # gateway/DNS falsos e coloca o atacante no caminho de todo o tráfego.
+    ROGUE_DHCP = "ROGUE_DHCP"
+    # Router Advertisement IPv6 de origem inesperada. Equivalente IPv6 do DHCP
+    # rogue e o vetor de MITM mais eficaz em redes duplo-stack, porque o IPv6
+    # tem precedência sobre o IPv4 na resolução de destino.
+    ROGUE_RA = "ROGUE_RA"
+    # Anúncio de vizinhança IPv6 (NDP) conflitante — o análogo IPv6 do ARP spoofing.
+    NDP_SPOOFING = "NDP_SPOOFING"
+    # Certificado TLS de um serviço mudou de impressão digital. Renovação
+    # legítima também muda, mas troca de emissor é sinal forte de interceptação.
+    TLS_CERT_CHANGED = "TLS_CERT_CHANGED"
+    # Servidor DNS da rede devolvendo resposta divergente para um domínio de
+    # referência, ou a própria lista de resolvedores mudou. Sequestro de DNS é
+    # um caminho de MITM que não precisa tocar em ARP/NDP.
+    DNS_HIJACK = "DNS_HIJACK"
+    # --- Higiene de serviços expostos ---
+    # Serviço/versão de uma porta já mapeada mudou: pode ser atualização
+    # legítima, troca de equipamento reaproveitando o IP, ou comprometimento.
+    SERVICE_CHANGED = "SERVICE_CHANGED"
+    # Configuração TLS fraca (TLS 1.0/1.1, assinatura SHA-1/MD5, chave curta,
+    # certificado autoassinado).
+    WEAK_TLS = "WEAK_TLS"
+    # Configuração insegura conhecida: SMBv1 habilitado, assinatura SMB não
+    # exigida, comunidade SNMP de fábrica ainda aceita. Não depende de CVE —
+    # é o padrão de fábrica que nunca foi trocado.
+    INSECURE_CONFIG = "INSECURE_CONFIG"
+    # Mesmo MAC aprendido em portas de acesso distintas do switch (ou de dois
+    # switches). Um endereço só pode estar fisicamente em uma porta: duas
+    # indicam MAC clonado ou laço de camada 2.
+    MAC_PORT_CONFLICT = "MAC_PORT_CONFLICT"
+    # Ponto de acesso Wi-Fi não autorizado anunciando um SSID vigiado (evil
+    # twin), ou rebaixamento da segurança de um BSSID conhecido. O desvio
+    # acontece no rádio, antes de qualquer pacote chegar à rede cabeada.
+    ROGUE_AP = "ROGUE_AP"
 
 
 class Severity(enum.Enum):
@@ -421,35 +462,61 @@ class Device(db.Model):
     ports = db.relationship("Port", backref="device", lazy="dynamic", cascade="all, delete-orphan")
     alerts = db.relationship("Alert", backref="device", lazy="dynamic")
 
+    def _current_ip_rows(self, version: int | None = None) -> list:
+        """Linhas DeviceIp atuais, deduplicadas por IP, mais recentes primeiro."""
+        query = DeviceIp.query.filter_by(device_id=self.id, is_current=True)
+        if version is not None:
+            query = query.filter(DeviceIp.ip_version == version)
+        rows = query.order_by(DeviceIp.last_seen_at.desc()).all()
+        seen: set[str] = set()
+        result = []
+        for r in rows:
+            if r.ip not in seen:
+                seen.add(r.ip)
+                result.append(r)
+        return result
+
     @property
     def current_ip(self):
-        """Retorna o IP atual do dispositivo (o mais recente marcado como current)."""
-        dip = (
-            DeviceIp.query.filter_by(device_id=self.id, is_current=True)
-            .order_by(DeviceIp.last_seen_at.desc())
-            .first()
-        )
-        return dip.ip if dip else None
+        """IP atual do dispositivo — o IPv4 tem precedência.
+
+        Todo o pipeline de scan ativo (nmap, ping, ARP) é escrito em torno de
+        IPv4; o IPv6 é catalogado em paralelo e escaneado pelo job dedicado.
+        Retornar um IPv6 aqui faria os chamadores antigos escanearem a família
+        errada. Só cai para IPv6 quando o device não tem nenhum IPv4 atual —
+        caso de um ativo exclusivamente IPv6.
+        """
+        rows = self._current_ip_rows(version=4) or self._current_ip_rows(version=6)
+        return rows[0].ip if rows else None
+
+    @property
+    def current_ipv4s(self) -> list[str]:
+        """IPv4 atuais do device (mais de um apenas quando is_multi_ip)."""
+        return [r.ip for r in self._current_ip_rows(version=4)]
+
+    @property
+    def current_ipv6s(self) -> list[str]:
+        """IPv6 atuais do device, roteáveis (global/ULA) antes dos link-local.
+
+        Um host com IPv6 costuma ter vários endereços ao mesmo tempo — um
+        link-local obrigatório, um global/ULA e possivelmente endereços
+        temporários de privacy extensions. Todos pertencem ao mesmo MAC e,
+        portanto, ao mesmo ativo.
+        """
+        from app.scanner.hosts6 import SCOPE_LINK_LOCAL, ipv6_scope
+        rows = self._current_ip_rows(version=6)
+        routable = [r.ip for r in rows if ipv6_scope(r.ip) != SCOPE_LINK_LOCAL]
+        link_local = [r.ip for r in rows if ipv6_scope(r.ip) == SCOPE_LINK_LOCAL]
+        return routable + link_local
 
     @property
     def current_ips(self) -> list[str]:
-        """Todos os IPs atuais — devices multi-IP (is_multi_ip) têm mais de um.
+        """Todos os IPs atuais, IPv4 primeiro e depois os IPv6.
 
         Deduplica defensivamente por IP: se o banco tiver linhas duplicadas para
         o mesmo (device, ip) marcadas como current, o IP aparece uma única vez.
         """
-        rows = (
-            DeviceIp.query.filter_by(device_id=self.id, is_current=True)
-            .order_by(DeviceIp.last_seen_at.desc())
-            .all()
-        )
-        seen: set[str] = set()
-        result: list[str] = []
-        for r in rows:
-            if r.ip not in seen:
-                seen.add(r.ip)
-                result.append(r.ip)
-        return result
+        return self.current_ipv4s + self.current_ipv6s
 
     @property
     def open_ports_count(self):
@@ -561,18 +628,52 @@ class Device(db.Model):
 # DeviceIp
 # ---------------------------------------------------------------------------
 
+def _ip_version_default(ctx) -> int:
+    """Deriva ip_version do próprio ``ip`` no INSERT.
+
+    Evita que qualquer ponto de criação de DeviceIp (import de arquivo, cadastro
+    manual, scanners) precise lembrar de informar a família — um valor errado
+    aqui faria o endereço sumir das queries de scan da família certa.
+    """
+    try:
+        ip = ctx.get_current_parameters().get("ip") or ""
+    except Exception:
+        return 4
+    return 6 if ":" in ip else 4
+
+
 class DeviceIp(db.Model):
     __tablename__ = "device_ips"
 
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.Integer, db.ForeignKey("devices.id"), nullable=False, index=True)
     ip = db.Column(db.String(45), nullable=False)  # suporta IPv6
+    # 4 ou 6. IPv4 e IPv6 NÃO são concorrentes: um mesmo device pode ter ambos
+    # marcados como is_current simultaneamente (o agrupamento é pelo MAC). A
+    # coluna existe para que as queries de scan possam escolher a família certa
+    # sem reparsear a string a cada linha.
+    ip_version = db.Column(
+        db.SmallInteger, default=lambda ctx: _ip_version_default(ctx),
+        nullable=False, index=True,
+    )
     first_seen_at = db.Column(db.DateTime, default=_utcnow)
     last_seen_at = db.Column(db.DateTime, default=_utcnow)
     is_current = db.Column(db.Boolean, default=True, index=True)
 
+    @property
+    def is_ipv6(self) -> bool:
+        return self.ip_version == 6
+
+    @property
+    def scope6(self) -> str:
+        """Escopo IPv6 ('global', 'ula', 'link-local') — vazio para IPv4."""
+        if self.ip_version != 6:
+            return ""
+        from app.scanner.hosts6 import ipv6_scope
+        return ipv6_scope(self.ip)
+
     def __repr__(self):
-        return f"<DeviceIp {self.ip} current={self.is_current}>"
+        return f"<DeviceIp {self.ip} v{self.ip_version} current={self.is_current}>"
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +700,12 @@ class Port(db.Model):
     # Portas autorizadas não geram alerta ao reaparecer ou mudar de estado —
     # somente desvios do baseline alertam.
     is_authorized = db.Column(db.Boolean, default=False, nullable=False)
+    # Impressão digital SHA-256 do certificado TLS (DER) e emissor, gravados na
+    # primeira verificação. Uma mudança de impressão com o MESMO emissor é
+    # renovação de rotina; mudança de emissor junto é o rastro típico de um
+    # proxy de interceptação (MITM) se colocando no meio da conexão.
+    tls_fingerprint = db.Column(db.String(64), nullable=True)
+    tls_issuer = db.Column(db.String(255), nullable=True)
 
     @property
     def is_open(self) -> bool:
@@ -878,10 +985,96 @@ class AuditLog(db.Model):
     details = db.Column(db.Text, default="", nullable=False)
     ip_address = db.Column(db.String(45), default="", nullable=False)
 
+    # --- Cadeia de integridade ---
+    # Cada entrada carrega o hash da anterior, formando uma cadeia: alterar o
+    # conteúdo de uma linha invalida o hash dela, e removê-la rompe o elo da
+    # seguinte. Um atacante que ganhe acesso ao banco não consegue mais apagar
+    # o rastro da própria invasão sem deixar evidência. Preenchidos
+    # automaticamente pelo listener ``_chain_audit_logs`` — nunca atribua na mão.
+    entry_hash = db.Column(db.String(64), default="", nullable=False, index=True)
+    prev_hash = db.Column(db.String(64), default="", nullable=False)
+
     user = db.relationship("User", backref=db.backref("audit_logs", lazy="dynamic"))
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Ordem de criação dentro de um mesmo flush. ``session.new`` é um
+        # IdentitySet sem ordem, e a cadeia precisa de uma sequência estável —
+        # senão duas entradas do mesmo flush encadeariam de forma arbitrária.
+        self._chain_seq = next(_audit_chain_seq)
+
+    def chain_payload(self) -> str:
+        """Serialização canônica dos campos cobertos pelo hash.
+
+        O ``id`` fica de fora de propósito: ele só existe depois do INSERT, e
+        gravá-lo exigiria um UPDATE posterior — janela em que a linha estaria
+        sem hash. A ordem é garantida pelo encadeamento (``prev_hash``), que já
+        detecta remoção, reordenação ou renumeração.
+        """
+        return "|".join((
+            self.created_at.isoformat(sep=" ", timespec="microseconds") if self.created_at else "",
+            str(self.user_id if self.user_id is not None else ""),
+            self.username or "",
+            self.action or "",
+            self.entity_type or "",
+            str(self.entity_id if self.entity_id is not None else ""),
+            self.details or "",
+            self.ip_address or "",
+        ))
+
+    def compute_hash(self, prev_hash: str) -> str:
+        """SHA-256 do elo anterior concatenado com o conteúdo desta entrada."""
+        raw = f"{prev_hash}|{self.chain_payload()}".encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
 
     def __repr__(self):
         return f"<AuditLog {self.action} user={self.username} at={self.created_at}>"
+
+
+# Elo inicial da cadeia (não existe entrada anterior à primeira).
+AUDIT_CHAIN_GENESIS = "0" * 64
+
+_audit_chain_seq = itertools.count()
+
+
+@sa_event.listens_for(db.session, "before_flush")
+def _chain_audit_logs(session, flush_context, instances):
+    """Atribui ``prev_hash``/``entry_hash`` a toda AuditLog nova antes do INSERT.
+
+    Fica num listener (e não em ``audit()``) para cobrir **qualquer** caminho de
+    criação — helper, CLI, scheduler ou um ``AuditLog(...)`` direto. Uma entrada
+    que escapasse daqui apareceria como buraco na verificação.
+
+    ``created_at`` é fixado aqui quando ainda está vazio: o default da coluna só
+    seria aplicado no INSERT, depois do hash, e o valor gravado não bateria com
+    o que foi assinado.
+
+    **Limite conhecido:** o elo anterior é lido do banco antes do INSERT, então
+    dois processos escrevendo ao mesmo tempo (``gunicorn -w N>1``) podem partir
+    do mesmo elo e bifurcar a cadeia. A verificação reporta isso como quebra de
+    *encadeamento*, categoria separada da quebra de *conteúdo* — esta última não
+    tem corrida possível e continua sendo prova de adulteração.
+    """
+    pending = [o for o in session.new if isinstance(o, AuditLog)]
+    if not pending:
+        return
+    pending.sort(key=lambda o: getattr(o, "_chain_seq", 0))
+
+    with session.no_autoflush:
+        last = (
+            session.query(AuditLog)
+            .filter(AuditLog.entry_hash != "")
+            .order_by(AuditLog.id.desc())
+            .first()
+        )
+    prev = last.entry_hash if last else AUDIT_CHAIN_GENESIS
+
+    for entry in pending:
+        if entry.created_at is None:
+            entry.created_at = _utcnow()
+        entry.prev_hash = prev
+        entry.entry_hash = entry.compute_hash(prev)
+        prev = entry.entry_hash
 
 
 # ---------------------------------------------------------------------------
