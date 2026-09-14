@@ -4334,7 +4334,12 @@ def perform_backup(dest: str | None = None, compress: bool = True) -> str:
 
     src_path = db_url.replace("sqlite:///", "")
     if not os.path.isabs(src_path):
-        src_path = os.path.abspath(src_path)
+        # Caminho relativo num URI SQLite é resolvido pelo Flask-SQLAlchemy
+        # contra a *instance folder*, não contra o diretório de trabalho —
+        # abspath() sozinho apontaria para o lugar errado e o backup falharia
+        # em silêncio no job agendado.
+        src_path = os.path.join(current_app.instance_path, src_path)
+    src_path = os.path.abspath(src_path)
     if not os.path.exists(src_path):
         raise RuntimeError(f"Banco não encontrado em: {src_path}")
 
